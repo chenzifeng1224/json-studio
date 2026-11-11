@@ -18,6 +18,10 @@ type TreeNode = {
   kind: 'folder' | 'file';
   children: TreeNode[];
   expanded: boolean;
+  // 云端目录按需加载：remote 表示需要展开时再向后端取一层，loaded 标记该层已取回。
+  remote?: boolean;
+  loaded?: boolean;
+  loading?: boolean;
 };
 let editor: monaco.editor.IStandaloneCodeEditor;
 let currentFile: string | null = null;
@@ -36,6 +40,13 @@ let localLoading = false;
 let cloudTreeNotice = '';
 let localTreeNotice = '';
 let configReturnFocus: HTMLElement | null = null;
+let cloudSearchQuery = '';
+let cloudSearchRoots: TreeNode[] | null = null;
+let cloudSearching = false;
+let cloudSearchNotice = '';
+let cloudSearchInfo = '';
+let cloudSearchTimer = 0;
+let cloudSearchSeq = 0;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const status = (message: string, kind = '') => { $('status').textContent = message; $('status').className = `status ${kind}`; };
@@ -102,12 +113,16 @@ function setTreeMessage(target: AppMode, text: string, kind = '') {
 }
 
 function updateCloudContext() {
-  const count = countFiles(cloudTreeRoot);
-  const prefix = currentPrefix.replace(/\/+$/, '');
-  const label = currentBucket ? `${currentBucket}${prefix ? ` / ${prefix}` : ''}` : '未配置 S3';
   const context = $('cloudContext');
-  context.textContent = cloudLoading ? '正在拉取…' : (count ? `${label} · ${count} 个 JSON` : label);
   context.classList.toggle('error', !currentBucket);
+  if (!currentBucket) { context.textContent = '未配置 S3'; return; }
+  const label = currentBucket;
+  if (cloudSearchQuery) {
+    context.textContent = cloudSearching ? '正在全桶搜索…' : (cloudSearchInfo || `搜索：${cloudSearchQuery}`);
+    return;
+  }
+  const count = countFiles(cloudTreeRoot);
+  context.textContent = cloudLoading ? '正在读取云端目录…' : (count ? `${label} · 已加载 ${count} 个 JSON` : label);
 }
 
 function updateLocalContext() {
@@ -148,16 +163,20 @@ function renderTreeNode(container: HTMLElement, node: TreeNode, depth: number) {
   row.append(marker, name);
 
   row.addEventListener('click', () => {
-    if (isFolder) {
-      node.expanded = !node.expanded;
-      renderTree();
-    } else {
-      void openTreeFile(node);
-    }
+    if (isFolder) void toggleFolder(node);
+    else void openTreeFile(node);
   });
   container.append(row);
 
   if (!isFolder || !node.expanded) return;
+  if (node.remote && !node.loaded) {
+    const pending = document.createElement('div');
+    pending.className = node.loading ? 'tree-empty pending' : 'tree-empty';
+    pending.style.paddingLeft = `${8 + (depth + 1) * 14}px`;
+    pending.textContent = node.loading ? '加载中…' : '展开后加载';
+    container.append(pending);
+    return;
+  }
   if (!node.children.length) {
     const empty = document.createElement('div');
     empty.className = 'tree-empty';
@@ -170,11 +189,6 @@ function renderTreeNode(container: HTMLElement, node: TreeNode, depth: number) {
 }
 
 function renderTree() {
-  if (mode === 'cloud' && cloudLoading && !cloudTreeRoot) {
-    setTreeMessage('cloud', '正在拉取云端 JSON…', 'pending');
-    updateTreeContext();
-    return;
-  }
   if (mode === 'local' && localLoading && !localTreeRoot) {
     setTreeMessage('local', '正在扫描本地 JSON…', 'pending');
     updateTreeContext();
@@ -183,13 +197,48 @@ function renderTree() {
 
   const container = treeContainer(mode);
   container.textContent = '';
-  const root = mode === 'cloud' ? cloudTreeRoot : localTreeRoot;
+
+  if (mode === 'cloud') {
+    if (!currentBucket) {
+      setTreeMessage('cloud', '尚未配置 S3，点击“配置”填写存储桶与密钥');
+      updateTreeContext();
+      return;
+    }
+    if (cloudSearchQuery) {
+      if (cloudSearching) {
+        setTreeMessage('cloud', '正在全桶搜索，请稍候…', 'pending');
+      } else if (cloudSearchNotice) {
+        setTreeMessage('cloud', cloudSearchNotice, 'error');
+      } else if (!cloudSearchRoots || !cloudSearchRoots.length) {
+        setTreeMessage('cloud', '没有匹配的 JSON 文件');
+      } else {
+        cloudSearchRoots.forEach(node => renderTreeNode(container, node, 0));
+      }
+      updateTreeContext();
+      return;
+    }
+    const root = cloudTreeRoot;
+    if (!root) {
+      setTreeMessage('cloud', cloudTreeNotice || '点击“刷新”读取云端目录');
+      updateTreeContext();
+      return;
+    }
+    if (!root.loaded) {
+      if (cloudTreeNotice) setTreeMessage('cloud', cloudTreeNotice, 'error');
+      else setTreeMessage('cloud', root.loading ? '正在读取云端目录…' : '点击“刷新”读取云端目录', root.loading ? 'pending' : '');
+      updateTreeContext();
+      return;
+    }
+    renderTreeNode(container, root, 0);
+    updateTreeContext();
+    return;
+  }
+
+  const root = localTreeRoot;
   if (!root) {
-    const notice = mode === 'cloud' ? cloudTreeNotice : localTreeNotice;
-    const fallback = mode === 'cloud'
-      ? (currentBucket ? '点击“刷新”拉取云端 JSON 列表' : '尚未配置 S3，点击“配置”填写存储桶与密钥')
-      : (localRootPath ? '点击“刷新”重新扫描' : '点击“打开文件夹”选择目录');
-    setTreeMessage(mode, notice || fallback, notice ? 'error' : '');
+    const notice = localTreeNotice;
+    const fallback = localRootPath ? '点击“刷新”重新扫描' : '点击“打开文件夹”选择目录';
+    setTreeMessage('local', notice || fallback, notice ? 'error' : '');
     updateTreeContext();
     return;
   }
@@ -329,9 +378,18 @@ monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
   validate: true, allowComments: false, schemas: [], enableSchemaRequest: false,
   comments: 'error', trailingCommas: 'error'
 });
+// 滚动条沿用界面深色系，避免 Monaco 默认的高亮滑杆与侧栏不一致。
+monaco.editor.defineTheme('json-studio-dark', {
+  base: 'vs-dark', inherit: true, rules: [],
+  colors: {
+    'scrollbarSlider.background': '#33404f80',
+    'scrollbarSlider.hoverBackground': '#41506ab3',
+    'scrollbarSlider.activeBackground': '#4a5f7dcc',
+  },
+});
 editor = monaco.editor.create($('editor'), {
   value: '{\n  "示例": "你好，JSON Studio",\n  "items": [1, 2, 3]\n}',
-  language: 'json', theme: 'vs-dark', automaticLayout: true, minimap: { enabled: true },
+  language: 'json', theme: 'json-studio-dark', automaticLayout: true, minimap: { enabled: true },
   fontSize: 14, tabSize: 2, insertSpaces: true, wordWrap: 'on',
   bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, highlightActiveBracketPair: true },
   matchBrackets: 'always', padding: { top: 14, bottom: 14 }, scrollBeyondLastLine: false
@@ -836,38 +894,161 @@ function updateBuckets(region: Region = currentRegion, selected = '') {
   select.innerHTML = opts.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join('');
   select.value = selected && opts.includes(selected) ? selected : opts[0];
 }
+function normalizePrefix(prefix: string): string {
+  const trimmed = prefix.replace(/^\/+/, '').replace(/\/+$/, '');
+  return trimmed ? `${trimmed}/` : '';
+}
+
+function makeCloudFolder(prefix: string): TreeNode {
+  return {
+    name: baseName(prefix.replace(/\/+$/, '')),
+    displayPath: prefix,
+    fullPath: prefix,
+    kind: 'folder',
+    children: [],
+    expanded: false,
+    remote: true,
+    loaded: false,
+  };
+}
+
+// 只请求当前一层（delimiter 分隔），避免一次列举整桶；文件内容仅在点击时才下载。
+async function ensureCloudChildren(node: TreeNode) {
+  if (node.kind !== 'folder' || !node.remote || node.loading || node.loaded) return;
+  node.loading = true;
+  renderTree();
+  try {
+    const level = await invoke<{ folders: string[]; files: string[] }>('list_s3_level', {
+      region: currentRegion,
+      bucket: currentBucket,
+      prefix: node.fullPath,
+    });
+    node.children = [
+      ...level.folders.map(makeCloudFolder),
+      ...level.files.map(key => ({
+        name: baseName(key),
+        displayPath: key,
+        fullPath: key,
+        kind: 'file' as const,
+        children: [],
+        expanded: false,
+      })),
+    ];
+    node.loaded = true;
+    node.expanded = true;
+    cloudTreeNotice = '';
+    status(`当前层级：${level.folders.length} 个文件夹 · ${level.files.length} 个 JSON`, 'success');
+  } catch (e) {
+    const message = zhError(e, '读取云端目录失败');
+    status(message, 'error');
+    cloudTreeNotice = message;
+    node.loaded = false;
+  } finally {
+    node.loading = false;
+    renderTree();
+  }
+}
+
+async function toggleFolder(node: TreeNode) {
+  if (node.kind !== 'folder') return;
+  node.expanded = !node.expanded;
+  renderTree();
+  if (node.expanded && node.remote && !node.loaded) await ensureCloudChildren(node);
+}
+
+function resetCloudRoot() {
+  const prefix = normalizePrefix(currentPrefix);
+  cloudTreeRoot = {
+    name: currentBucket,
+    displayPath: prefix,
+    fullPath: prefix,
+    kind: 'folder',
+    children: [],
+    expanded: true,
+    remote: true,
+    loaded: false,
+  };
+}
+
+function clearCloudSearch() {
+  cloudSearchSeq++;
+  cloudSearchQuery = '';
+  cloudSearchRoots = null;
+  cloudSearching = false;
+  cloudSearchNotice = '';
+  cloudSearchInfo = '';
+  const input = document.getElementById('cloudSearch') as HTMLInputElement | null;
+  if (input) input.value = '';
+}
+
 async function listS3() {
-  if (cloudLoading) return;
   if (!currentBucket) {
     openS3ConfigModal();
     status('请先配置 S3 存储桶', 'error');
     return;
   }
+  if (cloudLoading) return;
+  clearCloudSearch();
   cloudLoading = true;
   cloudTreeNotice = '';
-  status('正在拉取云端 JSON 列表…');
+  resetCloudRoot();
   renderTree();
-  updateTreeContext();
+  status('正在读取云端目录…');
+  const root = cloudTreeRoot;
   try {
-    const keys = await invoke<string[]>('list_json_objects', { region: currentRegion, bucket: currentBucket, prefix: currentPrefix });
-    cloudTreeRoot = {
-      name: currentBucket,
-      displayPath: '',
-      fullPath: currentBucket,
-      kind: 'folder',
-      expanded: true,
-      children: buildTree(keys.map(key => ({ displayPath: key, fullPath: key }))),
-    };
-    status(`找到 ${keys.length} 个 JSON 文件`, 'success');
-  } catch (e) {
-    const message = zhError(e, '拉取云端列表失败');
-    status(message, 'error');
-    cloudTreeNotice = message;
-    if (String(e).includes('尚未保存')) openS3ConfigModal();
+    if (root) await ensureCloudChildren(root);
   } finally {
     cloudLoading = false;
     renderTree();
     if (mode === 'cloud') highlightActiveTreeRow();
+  }
+}
+
+async function runCloudSearch(query: string) {
+  cloudSearchQuery = query.trim();
+  cloudSearchNotice = '';
+  cloudSearchInfo = '';
+  cloudSearchRoots = null;
+  window.clearTimeout(cloudSearchTimer);
+  if (!cloudSearchQuery) {
+    cloudSearching = false;
+    renderTree();
+    return;
+  }
+  if (!currentBucket) {
+    status('请先配置 S3 存储桶', 'error');
+    cloudSearchNotice = '请先配置 S3 存储桶';
+    renderTree();
+    return;
+  }
+  const seq = ++cloudSearchSeq;
+  cloudSearching = true;
+  renderTree();
+  status('正在全桶搜索 JSON，首次搜索需要扫描对象列表…');
+  try {
+    const result = await invoke<{ keys: string[]; truncated: boolean; scanned: number; cached: boolean }>('search_s3_json', {
+      region: currentRegion,
+      bucket: currentBucket,
+      query: cloudSearchQuery,
+      limit: 500,
+    });
+    if (seq !== cloudSearchSeq) return;
+    cloudSearchRoots = result.keys.length
+      ? buildTree(result.keys.map(key => ({ displayPath: key, fullPath: key })))
+      : [];
+    cloudSearchInfo = `${result.keys.length} 个匹配 · 全桶 ${result.scanned} 个 JSON${result.truncated ? ' · 已截断' : ''}`;
+    status(result.truncated
+      ? `匹配结果超过 500 个，仅显示前 500 个，请输入更精确的关键词`
+      : `搜索完成：${result.keys.length} 个匹配${result.cached ? '（缓存）' : ''}`, result.truncated ? '' : 'success');
+  } catch (e) {
+    if (seq !== cloudSearchSeq) return;
+    cloudSearchNotice = zhError(e, '搜索失败');
+    status(cloudSearchNotice, 'error');
+  } finally {
+    if (seq === cloudSearchSeq) {
+      cloudSearching = false;
+      renderTree();
+    }
   }
 }
 async function loadS3Object(key: string) {
@@ -1036,6 +1217,29 @@ $('openS3Config').onclick = openS3ConfigModal;
 $('closeS3Config').onclick = closeS3ConfigModal;
 $('cancelS3Config').onclick = closeS3ConfigModal;
 $('refreshS3').onclick = listS3;
+const cloudSearchInput = $('cloudSearch') as HTMLInputElement;
+cloudSearchInput.addEventListener('input', () => {
+  const value = cloudSearchInput.value;
+  window.clearTimeout(cloudSearchTimer);
+  cloudSearchTimer = window.setTimeout(() => { void runCloudSearch(value); }, 300);
+});
+cloudSearchInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    clearCloudSearch();
+    renderTree();
+    return;
+  }
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  window.clearTimeout(cloudSearchTimer);
+  void runCloudSearch(cloudSearchInput.value);
+});
+$('clearCloudSearch').onclick = () => {
+  clearCloudSearch();
+  renderTree();
+  cloudSearchInput.focus();
+};
 $('openLocalFolder').onclick = openLocalFolder;
 $('refreshLocal').onclick = loadLocalTree;
 $('saveConfig').onclick = async () => {

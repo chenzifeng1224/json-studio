@@ -25,6 +25,10 @@
             <button class="mini-btn" id="refreshS3" type="button">刷新</button>
           </div>
         </div>
+        <div class="search-box">
+          <input id="cloudSearch" type="text" placeholder="搜索文件名或文件夹（全桶）" autocomplete="off" spellcheck="false">
+          <button class="mini-btn" id="clearCloudSearch" type="button" aria-label="清空搜索">✕</button>
+        </div>
         <div id="cloudTree" class="file-tree"><div class="empty">正在读取 S3 配置…</div></div>
       </section>
       <section id="localPanel" class="panel" hidden>

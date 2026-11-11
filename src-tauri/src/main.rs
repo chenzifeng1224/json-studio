@@ -4,7 +4,10 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, Client};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 const GLOBAL_REGION: &str = "us-east-1";
@@ -132,19 +135,57 @@ fn write_local_json_file(path: String, body: String) -> Result<(), String> {
     fs::write(&path, body).map_err(|e| format!("写入本地文件失败：{e}"))
 }
 
+fn is_json_key(key: &str) -> bool { key.to_ascii_lowercase().ends_with(".json") }
+
+// 只读取对象元数据（ListObjectsV2），不下载任何文件内容。
+#[derive(Serialize)]
+struct S3Level {
+    folders: Vec<String>,
+    files: Vec<String>,
+}
+
+// 按层级列举：delimiter 让 S3 只返回当前层，避免一次扫描整桶造成长时间等待。
 #[tauri::command]
-async fn list_json_objects(region: RegionChoice, bucket: String, prefix: String) -> Result<Vec<String>, String> {
+async fn list_s3_level(region: RegionChoice, bucket: String, prefix: String) -> Result<S3Level, String> {
     let client = s3_client(region).await?;
+    let mut folders: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut req = client.list_objects_v2().bucket(&bucket).delimiter("/");
+        if !prefix.is_empty() { req = req.prefix(&prefix); }
+        if let Some(token) = continuation.as_deref() { req = req.continuation_token(token); }
+        let result = req.send().await.map_err(|e| format!("S3 列表请求失败：{e}"))?;
+        for common in result.common_prefixes() {
+            if let Some(child) = common.prefix() { folders.push(child.to_string()); }
+        }
+        for item in result.contents() {
+            if let Some(key) = item.key() {
+                if is_json_key(key) { files.push(key.to_string()); }
+            }
+        }
+        if result.is_truncated().unwrap_or(false) {
+            continuation = result.next_continuation_token().map(str::to_string);
+            if continuation.is_none() { break; }
+        } else { break; }
+    }
+    folders.sort();
+    folders.dedup();
+    files.sort();
+    files.dedup();
+    Ok(S3Level { folders, files })
+}
+
+async fn list_all_json_keys(client: &Client, bucket: &str) -> Result<Vec<String>, String> {
     let mut continuation: Option<String> = None;
     let mut output = Vec::new();
     loop {
-        let mut req = client.list_objects_v2().bucket(&bucket);
-        if !prefix.is_empty() { req = req.prefix(&prefix); }
+        let mut req = client.list_objects_v2().bucket(bucket);
         if let Some(token) = continuation.as_deref() { req = req.continuation_token(token); }
         let result = req.send().await.map_err(|e| format!("S3 列表请求失败：{e}"))?;
         for item in result.contents() {
             if let Some(key) = item.key() {
-                if key.to_ascii_lowercase().ends_with(".json") { output.push(key.to_string()); }
+                if is_json_key(key) { output.push(key.to_string()); }
             }
         }
         if result.is_truncated().unwrap_or(false) {
@@ -153,7 +194,54 @@ async fn list_json_objects(region: RegionChoice, bucket: String, prefix: String)
         } else { break; }
     }
     output.sort();
+    output.dedup();
     Ok(output)
+}
+
+// 全桶搜索必须有完整 key 列表，这里把首次扫描结果缓存 5 分钟，后续输入直接命中缓存。
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(300);
+const SEARCH_LIMIT_MAX: usize = 1000;
+static SEARCH_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<String>)>>> = OnceLock::new();
+
+#[derive(Serialize)]
+struct S3SearchResult {
+    keys: Vec<String>,
+    truncated: bool,
+    scanned: usize,
+    cached: bool,
+}
+
+#[tauri::command]
+async fn search_s3_json(region: RegionChoice, bucket: String, query: String, limit: usize) -> Result<S3SearchResult, String> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(S3SearchResult { keys: Vec::new(), truncated: false, scanned: 0, cached: false });
+    }
+    let cache = SEARCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = format!("{}|{}", region.region(), bucket);
+    let hit = cache.lock().ok()
+        .and_then(|guard| guard.get(&cache_key).cloned())
+        .filter(|(at, _)| at.elapsed() < SEARCH_CACHE_TTL);
+    let (all, cached) = match hit {
+        Some((_, keys)) => (keys, true),
+        None => {
+            let client = s3_client(region).await?;
+            let keys = list_all_json_keys(&client, &bucket).await?;
+            if let Ok(mut guard) = cache.lock() {
+                guard.insert(cache_key, (Instant::now(), keys.clone()));
+            }
+            (keys, false)
+        }
+    };
+    let cap = limit.clamp(1, SEARCH_LIMIT_MAX);
+    let mut keys = Vec::new();
+    let mut truncated = false;
+    for key in &all {
+        if !key.to_lowercase().contains(&needle) { continue; }
+        if keys.len() >= cap { truncated = true; break; }
+        keys.push(key.clone());
+    }
+    Ok(S3SearchResult { keys, truncated, scanned: all.len(), cached })
 }
 
 #[tauri::command]
@@ -179,7 +267,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![save_s3_credentials, credential_status, save_s3_preferences, load_s3_preferences, list_json_objects, get_s3_object, put_s3_object, list_local_json_tree, read_local_json_file, write_local_json_file])
+        .invoke_handler(tauri::generate_handler![save_s3_credentials, credential_status, save_s3_preferences, load_s3_preferences, list_s3_level, search_s3_json, get_s3_object, put_s3_object, list_local_json_tree, read_local_json_file, write_local_json_file])
         .run(tauri::generate_context!())
         .expect("应用启动失败");
 }
