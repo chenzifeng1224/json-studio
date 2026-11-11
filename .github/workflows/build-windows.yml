@@ -1,0 +1,59 @@
+name: 云端构建 Windows 安装包
+
+# 本地只保留源码，所有依赖安装 / 类型检查 / 前端打包 / Tauri 打包都在这里完成。
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 准备 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 构建产物
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: 安装前端依赖（云端）
+        run: npm install
+
+      - name: 前端类型检查与打包
+        run: npm run build
+
+      - name: 构建 Windows exe / msi
+        run: npm run tauri build
+
+      - name: 上传安装包到 Actions 制品
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-studio-windows
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/tauri-json-studio.exe
+          if-no-files-found: warn
+
+      - name: 打标签时发布到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/tauri-json-studio.exe
+          draft: true

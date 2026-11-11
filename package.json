@@ -1,0 +1,26 @@
+{
+  "name": "tauri-json-studio",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc && vite build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
+    "@tauri-apps/plugin-fs": "^2.2.0",
+    "@tauri-apps/plugin-opener": "^2.2.0",
+    "monaco-editor": "^0.52.2",
+    "lucide": "^0.468.0",
+    "lucide-static": "^0.468.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/node": "^22.13.4",
+    "typescript": "~5.7.2",
+    "vite": "^6.1.0"
+  }
+}
