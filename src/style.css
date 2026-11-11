@@ -59,6 +59,8 @@ button,input,select{font:inherit}button{cursor:pointer}.app{height:100%;display:
 .search-box input::placeholder{color:#66758a}
 .search-box input:focus{border-color:#4a9de8}
 .search-box .mini-btn{padding:4px 7px}
+.search-scope{background:#10151c;color:#b9c7d8;border:1px solid #3a4657;border-radius:6px;padding:4px 2px 4px 6px;font-size:11px;outline:none;flex-shrink:0}
+.search-scope:focus{border-color:#4a9de8}
 .tree-row{display:flex;width:100%;align-items:center;gap:4px;border:0;background:transparent;color:#c9d4e2;padding:5px 8px;border-radius:5px;font-size:11px;line-height:1.35;text-align:left;white-space:nowrap;overflow:hidden}
 .tree-row:hover{background:#202a38}
 .tree-row.active{background:#233348;box-shadow:inset 2px 0 0 #4a9de8}

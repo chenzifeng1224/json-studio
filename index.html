@@ -26,7 +26,11 @@
           </div>
         </div>
         <div class="search-box">
-          <input id="cloudSearch" type="text" placeholder="搜索文件名或文件夹（全桶）" autocomplete="off" spellcheck="false">
+          <select id="cloudSearchScope" class="search-scope" aria-label="搜索范围" title="同级：只搜索当前层（桶根 / Prefix 层）；全层级：扫描整桶对象列表">
+            <option value="level">同级</option>
+            <option value="deep">全层级</option>
+          </select>
+          <input id="cloudSearch" type="text" placeholder="搜索文件名或文件夹" autocomplete="off" spellcheck="false">
           <button class="mini-btn" id="clearCloudSearch" type="button" aria-label="清空搜索">✕</button>
         </div>
         <div id="cloudTree" class="file-tree"><div class="empty">正在读取 S3 配置…</div></div>

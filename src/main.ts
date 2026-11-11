@@ -47,6 +47,8 @@ let cloudSearchNotice = '';
 let cloudSearchInfo = '';
 let cloudSearchTimer = 0;
 let cloudSearchSeq = 0;
+type SearchScope = 'level' | 'deep';
+let cloudSearchScope: SearchScope = 'level';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const status = (message: string, kind = '') => { $('status').textContent = message; $('status').className = `status ${kind}`; };
@@ -912,6 +914,17 @@ function makeCloudFolder(prefix: string): TreeNode {
   };
 }
 
+function makeCloudFile(key: string): TreeNode {
+  return {
+    name: baseName(key),
+    displayPath: key,
+    fullPath: key,
+    kind: 'file',
+    children: [],
+    expanded: false,
+  };
+}
+
 // 只请求当前一层（delimiter 分隔），避免一次列举整桶；文件内容仅在点击时才下载。
 async function ensureCloudChildren(node: TreeNode) {
   if (node.kind !== 'folder' || !node.remote || node.loading || node.loaded) return;
@@ -925,14 +938,7 @@ async function ensureCloudChildren(node: TreeNode) {
     });
     node.children = [
       ...level.folders.map(makeCloudFolder),
-      ...level.files.map(key => ({
-        name: baseName(key),
-        displayPath: key,
-        fullPath: key,
-        kind: 'file' as const,
-        children: [],
-        expanded: false,
-      })),
+      ...level.files.map(makeCloudFile),
     ];
     node.loaded = true;
     node.expanded = true;
@@ -1022,24 +1028,31 @@ async function runCloudSearch(query: string) {
     return;
   }
   const seq = ++cloudSearchSeq;
+  const scope = cloudSearchScope;
   cloudSearching = true;
   renderTree();
-  status('正在全桶搜索 JSON，首次搜索需要扫描对象列表…');
+  status(scope === 'level' ? '正在当前层搜索…' : '正在全桶搜索 JSON，首次搜索需要扫描对象列表…');
   try {
-    const result = await invoke<{ keys: string[]; truncated: boolean; scanned: number; cached: boolean }>('search_s3_json', {
+    const result = await invoke<{ folders: string[]; files: string[]; truncated: boolean; scanned: number; cached: boolean }>('search_s3_json', {
       region: currentRegion,
       bucket: currentBucket,
       query: cloudSearchQuery,
+      scope,
+      prefix: normalizePrefix(currentPrefix),
       limit: 500,
     });
     if (seq !== cloudSearchSeq) return;
-    cloudSearchRoots = result.keys.length
-      ? buildTree(result.keys.map(key => ({ displayPath: key, fullPath: key })))
-      : [];
-    cloudSearchInfo = `${result.keys.length} 个匹配 · 全桶 ${result.scanned} 个 JSON${result.truncated ? ' · 已截断' : ''}`;
+    // 同级：命中的文件夹保留为懒加载节点，展开时再取下一层；全层级：按完整 key 还原目录层级。
+    cloudSearchRoots = scope === 'deep'
+      ? (result.files.length ? buildTree(result.files.map(key => ({ displayPath: key, fullPath: key }))) : [])
+      : [...result.folders.map(makeCloudFolder), ...result.files.map(makeCloudFile)];
+    const matched = result.folders.length + result.files.length;
+    cloudSearchInfo = scope === 'deep'
+      ? `${matched} 个匹配 · 全桶 ${result.scanned} 个 JSON${result.truncated ? ' · 已截断' : ''}`
+      : `${matched} 个匹配 · 当前层 ${result.scanned} 项${result.truncated ? ' · 已截断' : ''}`;
     status(result.truncated
       ? `匹配结果超过 500 个，仅显示前 500 个，请输入更精确的关键词`
-      : `搜索完成：${result.keys.length} 个匹配${result.cached ? '（缓存）' : ''}`, result.truncated ? '' : 'success');
+      : `搜索完成：${matched} 个匹配${result.cached ? '（缓存）' : ''}`, result.truncated ? '' : 'success');
   } catch (e) {
     if (seq !== cloudSearchSeq) return;
     cloudSearchNotice = zhError(e, '搜索失败');
@@ -1240,6 +1253,13 @@ $('clearCloudSearch').onclick = () => {
   renderTree();
   cloudSearchInput.focus();
 };
+const cloudSearchScopeSelect = $('cloudSearchScope') as HTMLSelectElement;
+cloudSearchScopeSelect.addEventListener('change', () => {
+  cloudSearchScope = cloudSearchScopeSelect.value === 'deep' ? 'deep' : 'level';
+  if (!cloudSearchQuery) return;
+  window.clearTimeout(cloudSearchTimer);
+  void runCloudSearch(cloudSearchInput.value);
+});
 $('openLocalFolder').onclick = openLocalFolder;
 $('refreshLocal').onclick = loadLocalTree;
 $('saveConfig').onclick = async () => {

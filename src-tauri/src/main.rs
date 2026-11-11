@@ -145,6 +145,18 @@ struct S3Level {
 }
 
 // 按层级列举：delimiter 让 S3 只返回当前层，避免一次扫描整桶造成长时间等待。
+async fn list_level_page(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    continuation: Option<&str>,
+) -> Result<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output, String> {
+    let mut req = client.list_objects_v2().bucket(bucket).delimiter("/");
+    if !prefix.is_empty() { req = req.prefix(prefix); }
+    if let Some(token) = continuation { req = req.continuation_token(token); }
+    req.send().await.map_err(|e| format!("S3 列表请求失败：{e}"))
+}
+
 #[tauri::command]
 async fn list_s3_level(region: RegionChoice, bucket: String, prefix: String) -> Result<S3Level, String> {
     let client = s3_client(region).await?;
@@ -152,10 +164,7 @@ async fn list_s3_level(region: RegionChoice, bucket: String, prefix: String) -> 
     let mut files: Vec<String> = Vec::new();
     let mut continuation: Option<String> = None;
     loop {
-        let mut req = client.list_objects_v2().bucket(&bucket).delimiter("/");
-        if !prefix.is_empty() { req = req.prefix(&prefix); }
-        if let Some(token) = continuation.as_deref() { req = req.continuation_token(token); }
-        let result = req.send().await.map_err(|e| format!("S3 列表请求失败：{e}"))?;
+        let result = list_level_page(&client, &bucket, &prefix, continuation.as_deref()).await?;
         for common in result.common_prefixes() {
             if let Some(child) = common.prefix() { folders.push(child.to_string()); }
         }
@@ -205,18 +214,69 @@ static SEARCH_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<String>)>>> = 
 
 #[derive(Serialize)]
 struct S3SearchResult {
-    keys: Vec<String>,
+    folders: Vec<String>,
+    files: Vec<String>,
     truncated: bool,
     scanned: usize,
     cached: bool,
 }
 
+fn name_matches(prefix_or_key: &str, needle: &str) -> bool {
+    let trimmed = prefix_or_key.trim_end_matches('/');
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    name.to_lowercase().contains(needle)
+}
+
+// scope = "level"：只列举当前层（文件夹 + 文件）并按名称模糊匹配，命中的文件夹交由前端懒加载展开；
+// scope = "deep"：扫描整桶 key 列表（仅元数据）后按完整路径模糊匹配，首次结果缓存 5 分钟。
 #[tauri::command]
-async fn search_s3_json(region: RegionChoice, bucket: String, query: String, limit: usize) -> Result<S3SearchResult, String> {
+async fn search_s3_json(region: RegionChoice, bucket: String, query: String, scope: String, prefix: String, limit: usize) -> Result<S3SearchResult, String> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
-        return Ok(S3SearchResult { keys: Vec::new(), truncated: false, scanned: 0, cached: false });
+        return Ok(S3SearchResult { folders: Vec::new(), files: Vec::new(), truncated: false, scanned: 0, cached: false });
     }
+    let cap = limit.clamp(1, SEARCH_LIMIT_MAX);
+
+    if scope != "deep" {
+        let client = s3_client(region).await?;
+        let mut folders: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        let mut matched = 0usize;
+        let mut scanned = 0usize;
+        let mut truncated = false;
+        let mut continuation: Option<String> = None;
+        loop {
+            let result = list_level_page(&client, &bucket, &prefix, continuation.as_deref()).await?;
+            for common in result.common_prefixes() {
+                let Some(child) = common.prefix() else { continue };
+                scanned += 1;
+                if !name_matches(child, &needle) { continue; }
+                if matched >= cap { truncated = true; break; }
+                matched += 1;
+                folders.push(child.to_string());
+            }
+            if truncated { break; }
+            for item in result.contents() {
+                let Some(key) = item.key() else { continue };
+                scanned += 1;
+                if !is_json_key(key) || !name_matches(key, &needle) { continue; }
+                if matched >= cap { truncated = true; break; }
+                matched += 1;
+                files.push(key.to_string());
+            }
+            if truncated { break; }
+            if result.is_truncated().unwrap_or(false) {
+                continuation = result.next_continuation_token().map(str::to_string);
+                if continuation.is_none() { break; }
+            } else { break; }
+        }
+        folders.sort();
+        folders.dedup();
+        files.sort();
+        files.dedup();
+        return Ok(S3SearchResult { folders, files, truncated, scanned, cached: false });
+    }
+
     let cache = SEARCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let cache_key = format!("{}|{}", region.region(), bucket);
     let hit = cache.lock().ok()
@@ -233,15 +293,14 @@ async fn search_s3_json(region: RegionChoice, bucket: String, query: String, lim
             (keys, false)
         }
     };
-    let cap = limit.clamp(1, SEARCH_LIMIT_MAX);
-    let mut keys = Vec::new();
+    let mut files = Vec::new();
     let mut truncated = false;
     for key in &all {
         if !key.to_lowercase().contains(&needle) { continue; }
-        if keys.len() >= cap { truncated = true; break; }
-        keys.push(key.clone());
+        if files.len() >= cap { truncated = true; break; }
+        files.push(key.clone());
     }
-    Ok(S3SearchResult { keys, truncated, scanned: all.len(), cached })
+    Ok(S3SearchResult { folders: Vec::new(), files, truncated, scanned: all.len(), cached })
 }
 
 #[tauri::command]
