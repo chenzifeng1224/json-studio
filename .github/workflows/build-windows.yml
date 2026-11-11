@@ -35,7 +35,7 @@ jobs:
       - name: 前端类型检查与打包
         run: npm run build
 
-      - name: 构建 Windows exe / msi
+      - name: 构建 Windows NSIS 安装包
         run: npm run tauri build
 
       - name: 上传安装包到 Actions 制品
@@ -43,7 +43,6 @@ jobs:
         with:
           name: json-studio-windows
           path: |
-            src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/tauri-json-studio.exe
           if-no-files-found: warn
@@ -53,7 +52,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/tauri-json-studio.exe
           draft: true

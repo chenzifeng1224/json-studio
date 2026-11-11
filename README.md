@@ -71,6 +71,6 @@ npm run tauri dev
 
 - 工作流：`.github/workflows/build-windows.yml`，使用 `windows-latest`（自带 Node、Rust、WebView2）。
 - 触发：推送 `main`、`v*` 标签，或在 Actions 页手动运行。
-- 步骤：`npm install` → `npm run build`（tsc + vite）→ `npm run tauri build` → `.msi` / `.exe` 上传为 Actions 制品；打 `v*` 标签时额外生成草稿 Release。
+- 步骤：`npm install` → `npm run build`（tsc + vite）→ `npm run tauri build` → NSIS `.exe` 安装包上传为 Actions 制品；打 `v*` 标签时额外生成草稿 Release。
 - 首次云端构建需要编译 AWS SDK 等 Rust 依赖，耗时较长属正常；`swatinem/rust-cache` 会缓存后续构建。
 - 仓库需开启 Actions 的读写权限（Settings → Actions → Workflow permissions → Read and write permissions），否则草稿 Release 可能发布失败。
