@@ -31,7 +31,19 @@
         <div class="spacer"></div><button class="btn primary" id="pushS3">推送覆盖 S3 原文件</button>
       </div>
       <div class="editor-wrap"><div id="editor" class="editor"></div></div>
-      <footer class="bottom"><span id="validation" class="validation good">✓ JSON 有效</span><span id="errorText">无语法错误</span><span id="dirty">● 未命名</span><span id="status" class="status">就绪</span></footer>
+      <section id="diagnosticsPanel" class="diagnostics" aria-label="问题诊断">
+        <div id="diagnosticsToggle" class="diagnostics-header" role="button" tabindex="0" aria-expanded="true" aria-controls="diagnosticsBody">
+          <span class="diagnostics-title">问题诊断</span>
+          <span id="diagnosticsSummary" class="diagnostics-summary" aria-live="polite">校验中…</span>
+          <span class="spacer"></span>
+          <span class="diagnostics-shortcut">F8 下一个 · Shift+F8 上一个</span>
+          <span id="diagnosticsChevron" class="diagnostics-chevron">▾</span>
+        </div>
+        <div id="diagnosticsBody" class="diagnostics-body">
+          <div id="diagnosticsList" class="diagnostics-list" role="list"></div>
+        </div>
+      </section>
+      <footer class="bottom"><span id="validation" class="validation good" role="button" tabindex="0" title="点击打开问题诊断">✓ JSON 有效</span><span id="errorText" class="error-text" role="button" tabindex="0" title="点击定位到第一个问题">无语法错误</span><span id="dirty">● 未命名</span><span id="status" class="status">就绪</span></footer>
     </main>
   </div>
 </div></div><script type="module" src="/src/main.ts"></script></body>

@@ -4,7 +4,8 @@
 
 ## 功能
 
-- Monaco Editor：JSON 语法高亮、实时语法诊断、括号匹配与括号对颜色提示。
+- Monaco Editor：JSON 语法高亮、实时语法诊断、括号匹配与括号对颜色提示、默认自动换行。
+- 底部“问题诊断”面板：收集 Monaco 诊断标记，显示错误/警告数量、类型、行列位置与中文说明；点击条目或按 `F8` / `Shift+F8` 精准跳转，行号区同步显示错误标记。
 - 当前括号匹配使用高亮背景 + 黄色描边，并在编辑器光标位于括号附近时突出显示配对括号。
 - JSON 格式化（2 空格缩进）、压缩。
 - 指定对象/数组路径压缩为单行：支持 `data.items`、`$.data.items`、`items[0]` 等路径。
@@ -55,7 +56,7 @@ npm run tauri dev
 ## 当前版本说明 / 后续可增强
 
 - 当前“指定路径压缩”使用格式化后节点文本定位；当相同 JSON 子树在文件中重复出现时，会提示定位失败或可能命中首个匹配。建议后续升级为基于 Monaco AST/token offset 的节点范围编辑。
-- JSON 校验以标准 `JSON.parse` / `serde_json` 为准，不接受注释、尾逗号、NaN、Infinity。
+- JSON 语法诊断以 Monaco JSON 语言服务产生的 marker 为唯一数据源，不使用正则判断 JSON 是否合法；格式化、压缩与推送前仍用 `JSON.parse` / `serde_json` 取值并作为最后防线。不接受注释、尾逗号、NaN、Infinity。
 - 为避免意外数据损坏，上传操作始终校验 JSON；当前不提供删除对象或批量上传功能。
 
 ## 界面语言
@@ -63,7 +64,7 @@ npm run tauri dev
 - 全部界面、状态提示与错误信息为简体中文。品牌名 `JSON Studio` 与技术专名（S3 / Bucket / Prefix / Access Key）按惯例保留，标签中附中文说明。
 - Monaco Editor 内置菜单、查找替换、命令面板等文案由 `vite.config.ts` 的 `monacoZhCN()` 插件在构建时注入，词条表为 `src/monaco.zh-cn.json`（取自 monaco-editor 0.52.2 官方 zh-cn 语言包，1279 条「英文 → 中文」映射）。`optimizeDeps.exclude: ["monaco-editor"]` 用于跳过 esbuild 预构建，保证开发模式同样生效。未命中的词条回退英文，不影响功能。
 - 升级 monaco-editor 后需重新生成词条表：取同版本 `dev/vs/editor/editor.main.js` 中的 `localize(下标, "英文")` 与 `dev/vs/nls.messages.zh-cn.js` 的「下标 → 中文」数组建立映射。插件找不到 `nls.js` 的 `_format` 时会直接让构建报错，避免静默退回英文。
-- `src/main.ts` 的 `zhError()` / `zhDiagnostic()` 负责把浏览器 `JSON.parse` 报错、Monaco JSON 诊断、AWS SDK / 系统底层错误确定性映射为中文；未覆盖的保留英文原文作为技术详情。Rust 后端 `map_err` 统一使用中文说明，SDK 原始错误作为括号内的详情保留。
+- `src/main.ts` 的 `zhError()` 负责文件 / 网络 / 后端错误的兜底翻译；Monaco 诊断优先按 marker code 映射中文，code 缺失时才用关键词兜底，并保留英文原文作为技术详情。Rust 后端 `map_err` 统一使用中文说明，SDK 原始错误作为括号内的详情保留。
 
 ## 云端构建（本地零依赖）
 

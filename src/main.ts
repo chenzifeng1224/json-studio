@@ -13,7 +13,6 @@ type S3Config = { region: Region; bucket: string; prefix: string; accessKey: str
 let editor: monaco.editor.IStandaloneCodeEditor;
 let currentFile: string | null = null;
 let currentObjectKey: string | null = null;
-let valid = true;
 let compactPaths: string[] = [];
 let currentRegion: Region = 'global';
 
@@ -48,18 +47,103 @@ const ZH_ERROR_RULES: [RegExp, string][] = [
   [/connection refused|network|dns|socket/i, '网络连接失败，请检查网络'],
 ];
 const translateError = (raw: string) => ZH_ERROR_RULES.find(([re]) => re.test(raw))?.[1] || '';
+// 仅用于文件 / 网络 / 后端错误的兜底翻译，不参与 JSON 语法定位。
 const zhError = (e: unknown, prefix = '操作失败') => {
   const raw = String(e ?? '').replace(/^Error:\s*/i, '').trim();
   if (!raw) return `${prefix}：未知错误`;
   const translated = translateError(raw);
-  const pos = raw.match(/position\s+(\d+)/i);
-  const where = pos ? `（字符位置 ${pos[1]}）` : '';
-  if (translated) return `${prefix}：${translated}${where}`;
+  if (translated) return `${prefix}：${translated}`;
   // 后端已返回中文说明时直接使用；纯英文错误补中文说明，原文附后便于排查。
   return /[\u4e00-\u9fa5]/.test(raw) ? raw : `${prefix}：${raw}`;
 };
-const zhDiagnostic = (message: string) =>
-  translateError(message) || (/[\u4e00-\u9fa5]/.test(message) ? message : `语法错误：${message}`);
+// Monaco JSON worker 的错误码映射（对应 jsonc-parser 的 ParseErrorCode）。
+// 优先按 code 翻译，避免依赖随版本变化的英文文案；code 缺失时才回退到关键词匹配。
+const JSON_ERROR_MESSAGES: Record<string, string> = {
+  '1': '出现无法识别的符号',
+  '2': '数字格式不正确',
+  '3': '属性名必须使用双引号',
+  '4': '此处缺少值',
+  '5': '属性名后缺少冒号',
+  '6': '此处缺少逗号',
+  '7': '缺少右花括号 }',
+  '8': '缺少右方括号 ]',
+  '9': '结束符之后存在多余内容',
+  '10': 'JSON 中不允许写注释',
+  '11': '注释未正确闭合',
+  '12': '字符串未正确闭合',
+  '13': '数字未正确结束',
+  '14': 'Unicode 转义格式不正确',
+  '15': '转义字符不正确',
+  '16': '出现无法识别的字符',
+  InvalidSymbol: '出现无法识别的符号',
+  InvalidNumberFormat: '数字格式不正确',
+  PropertyNameExpected: '属性名必须使用双引号',
+  ValueExpected: '此处缺少值',
+  ColonExpected: '属性名后缺少冒号',
+  CommaExpected: '此处缺少逗号',
+  CloseBraceExpected: '缺少右花括号 }',
+  CloseBracketExpected: '缺少右方括号 ]',
+  EndOfFileExpected: '结束符之后存在多余内容',
+  InvalidCommentToken: 'JSON 中不允许写注释',
+  UnexpectedEndOfComment: '注释未正确闭合',
+  UnexpectedEndOfString: '字符串未正确闭合',
+  UnexpectedEndOfNumber: '数字未正确结束',
+  InvalidUnicode: 'Unicode 转义格式不正确',
+  InvalidEscapeCharacter: '转义字符不正确',
+  InvalidCharacter: '出现无法识别的字符',
+};
+const JSON_ERROR_HINTS: Record<string, string> = {
+  '3': '属性名必须使用双引号包裹',
+  '4': '冒号或逗号后缺少值',
+  '5': '属性名后必须使用冒号',
+  '6': '对象属性或数组元素之间必须用逗号分隔',
+  '7': '对象缺少结束的右花括号',
+  '8': '数组缺少结束的右方括号',
+  '12': '字符串缺少结束引号',
+  PropertyNameExpected: '属性名必须使用双引号包裹',
+  ValueExpected: '冒号或逗号后缺少值',
+  ColonExpected: '属性名后必须使用冒号',
+  CommaExpected: '对象属性或数组元素之间必须用逗号分隔',
+  CloseBraceExpected: '对象缺少结束的右花括号',
+  CloseBracketExpected: '数组缺少结束的右方括号',
+  UnexpectedEndOfString: '字符串缺少结束引号',
+};
+
+type DiagnosticKind = '语法' | '结构' | '业务' | '校验';
+type DiagnosticView = {
+  marker: monaco.editor.IMarker;
+  message: string;
+  raw: string;
+  kind: DiagnosticKind;
+  severity: 'error' | 'warning';
+};
+
+function markerCode(marker: monaco.editor.IMarker): string {
+  const code = marker.code as unknown;
+  if (typeof code === 'string' || typeof code === 'number') return String(code);
+  if (code && typeof code === 'object' && 'value' in code) {
+    return String((code as { value: unknown }).value);
+  }
+  return '';
+}
+
+function localizeMarker(marker: monaco.editor.IMarker): string {
+  const code = markerCode(marker);
+  const translated = JSON_ERROR_MESSAGES[code];
+  if (translated) {
+    const hint = JSON_ERROR_HINTS[code];
+    return hint ? `${translated}（${hint}）` : translated;
+  }
+  const fallback = translateError(marker.message);
+  if (fallback) return fallback;
+  return /[\u4e00-\u9fa5]/.test(marker.message) ? marker.message : `语法错误：${marker.message}`;
+}
+
+function classifyMarker(marker: monaco.editor.IMarker): DiagnosticKind {
+  if (marker.owner === 'json-studio') return '业务';
+  if (marker.owner === 'json') return '语法';
+  return '校验';
+}
 
 monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
   validate: true, allowComments: false, schemas: [], enableSchemaRequest: false,
@@ -68,53 +152,352 @@ monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
 editor = monaco.editor.create($('editor'), {
   value: '{\n  "示例": "你好，JSON Studio",\n  "items": [1, 2, 3]\n}',
   language: 'json', theme: 'vs-dark', automaticLayout: true, minimap: { enabled: true },
-  fontSize: 14, tabSize: 2, insertSpaces: true, wordWrap: 'off',
+  fontSize: 14, tabSize: 2, insertSpaces: true, wordWrap: 'on',
   bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, highlightActiveBracketPair: true },
   matchBrackets: 'always', padding: { top: 14, bottom: 14 }, scrollBeyondLastLine: false
 });
-editor.onDidChangeModelContent(() => { $('dirty').textContent = '● 有未保存修改'; validateNow(); });
-editor.onDidChangeCursorPosition(() => highlightMatchingBracket());
+editor.onDidChangeModelContent(() => { $('dirty').textContent = '● 有未保存修改'; });
+// 光标位置变化时高亮匹配的两端括号（仅更新装饰，不移动视口、不改变光标）
+const bracketDecorations = editor.createDecorationsCollection();
+// Monaco 0.52 没有公开 findMatchingBracket，这里用字符串感知的括号配对实现，
+// 并按模型版本缓存，避免每次移动光标都重新扫描整篇 JSON。
+let bracketPairCache: { versionId: number; pairs: Map<number, number> } | null = null;
 
-function validateNow() {
-  const model = editor.getModel(); if (!model) return;
-  const markers = monaco.editor.getModelMarkers({ resource: model.uri });
-  const errors = markers.filter(m => m.severity === monaco.MarkerSeverity.Error);
-  valid = errors.length === 0;
-  $('validation').textContent = valid ? '✓ JSON 有效' : `✕ ${errors.length} 处语法错误`;
-  $('validation').className = valid ? 'validation good' : 'validation bad';
-  if (errors.length) $('errorText').textContent = `第 ${errors[0].startLineNumber} 行第 ${errors[0].startColumn} 列：${zhDiagnostic(errors[0].message)}`;
-  else $('errorText').textContent = '无语法错误';
-}
-function highlightMatchingBracket() {
-  const model = editor.getModel(); if (!model) return;
-  const pos = editor.getPosition(); if (!pos) return;
-  const line = model.getLineContent(pos.lineNumber);
-  const col = pos.column - 1;
-  const pairs: Record<string,string> = { '{':'}', '[':']', '}':'{', ']':'[' };
-  const ch = line[col] || line[col - 1];
-  if (!ch || !pairs[ch]) { bracketDecoration.set([]); return; }
-  const offset = model.getOffsetAt({ lineNumber: pos.lineNumber, column: ch === line[col] ? col + 1 : col });
-  const text = model.getValue(); const openChar = ch === '{' || ch === '[' ? ch : pairs[ch];
-  const closeChar = pairs[openChar]; let depth = 0, match = -1, direction = ch === openChar ? 1 : -1;
-  for (let i = offset - (direction === 1 ? 0 : 1); i >= 0 && i < text.length; i += direction) {
-    const c = text[i];
-    if (c === openChar) depth += direction === 1 ? 1 : -1;
-    if (c === closeChar) depth += direction === 1 ? -1 : 1;
-    if (depth === 0) { match = i; break; }
+function getBracketPairs(model: monaco.editor.ITextModel): Map<number, number> {
+  const versionId = model.getVersionId();
+  if (bracketPairCache?.versionId === versionId) return bracketPairCache.pairs;
+
+  const text = model.getValue();
+  const pairs = new Map<number, number>();
+  const stack: { char: string; index: number }[] = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') { inString = true; continue; }
+    if (char === '{' || char === '[') { stack.push({ char, index }); continue; }
+    if (char !== '}' && char !== ']') continue;
+    const expected = char === '}' ? '{' : '[';
+    const top = stack[stack.length - 1];
+    if (top?.char !== expected) continue;
+    stack.pop();
+    pairs.set(top.index, index);
+    pairs.set(index, top.index);
   }
-  if (match < 0) { bracketDecoration.set([]); return; }
-  const a = model.getPositionAt(offset - (direction === 1 ? 0 : 1));
-  const b = model.getPositionAt(match);
-  bracketDecoration.set([a,b].map(p => ({ range: new monaco.Range(p.lineNumber,p.column,p.lineNumber,p.column+1), options: { inlineClassName: 'bracket-match-strong', overviewRuler: { color: '#ffd166', position: monaco.editor.OverviewRulerLane.Center } } })));
+
+  bracketPairCache = { versionId, pairs };
+  return pairs;
 }
-const bracketDecoration = editor.createDecorationsCollection([]);
+
+editor.onDidChangeCursorPosition((event) => {
+  const model = editor.getModel();
+  if (!model) { bracketDecorations.clear(); return; }
+  const offset = model.getOffsetAt(event.position);
+  const pairs = getBracketPairs(model);
+  let matchedRanges: monaco.Range[] | null = null;
+
+  // 光标可能停在括号之后，因此同时检查前一个字符。
+  for (const candidate of [offset, offset - 1]) {
+    const other = pairs.get(candidate);
+    if (other === undefined) continue;
+    const start = model.getPositionAt(Math.min(candidate, other));
+    const end = model.getPositionAt(Math.max(candidate, other));
+    matchedRanges = [
+      new monaco.Range(start.lineNumber, start.column, start.lineNumber, start.column + 1),
+      new monaco.Range(end.lineNumber, end.column, end.lineNumber, end.column + 1),
+    ];
+    break;
+  }
+
+  if (!matchedRanges) { bracketDecorations.clear(); return; }
+  bracketDecorations.set(matchedRanges.map((range) => ({
+    range,
+    options: {
+      inlineClassName: 'bracket-pair-strong',
+      stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
+    }
+  })));
+});
+
+// ── 精准诊断 ──────────────────────────────────────────────────────────
+// 唯一数据源是 Monaco 的 marker：语法对错、行列位置、波浪线和悬停提示
+// 都来自 JSON 语言服务。这里不自行解析 JSON，也不解析 JSON.parse 的报错文本。
+const MAX_RENDERED_DIAGNOSTICS = 200;
+let diagnostics: DiagnosticView[] = [];
+let activeDiagnostic = -1;
+let diagnosticsPending = false;
+let diagnosticsTimer = 0;
+let diagnosticsSignature = '';
+const diagnosticDecorations = editor.createDecorationsCollection();
+
+function formatLocation(marker: monaco.editor.IMarker): string {
+  return `第 ${marker.startLineNumber} 行，第 ${marker.startColumn} 列`;
+}
+
+function collectDiagnostics(): DiagnosticView[] {
+  const model = editor.getModel();
+  if (!model) return [];
+  return monaco.editor.getModelMarkers({ resource: model.uri })
+    .filter(marker => marker.severity === monaco.MarkerSeverity.Error || marker.severity === monaco.MarkerSeverity.Warning)
+    .sort((a, b) => b.severity - a.severity || a.startLineNumber - b.startLineNumber || a.startColumn - b.startColumn)
+    .map(marker => ({
+      marker,
+      message: localizeMarker(marker),
+      raw: marker.message,
+      kind: classifyMarker(marker),
+      severity: marker.severity === monaco.MarkerSeverity.Error ? ('error' as const) : ('warning' as const),
+    }));
+}
+
+function diagnosticsKey(items: DiagnosticView[]): string {
+  return items.map(item => [
+    item.marker.severity, item.marker.startLineNumber, item.marker.startColumn,
+    item.marker.endLineNumber, item.marker.endColumn, item.marker.owner, item.raw,
+  ].join(':')).join('\n');
+}
+
+function updateDiagnosticsSummary() {
+  const summary = $('diagnosticsSummary');
+  if (diagnosticsPending) { summary.textContent = '校验中…'; return; }
+  const errors = diagnostics.filter(item => item.severity === 'error').length;
+  const warnings = diagnostics.length - errors;
+  if (!errors && !warnings) { summary.textContent = '没有问题'; return; }
+  const parts: string[] = [];
+  if (errors) parts.push(`${errors} 个错误`);
+  if (warnings) parts.push(`${warnings} 个警告`);
+  summary.textContent = parts.join(' · ');
+}
+
+function renderEditorDiagnosticDecorations() {
+  if (!editor.getModel()) { diagnosticDecorations.clear(); return; }
+  // 同一行有错误时优先显示错误色；行号区只做窄条标记，不额外占用 glyph margin。
+  const lines = new Map<number, 'error' | 'warning'>();
+  for (const item of diagnostics) {
+    const line = item.marker.startLineNumber;
+    if (item.severity === 'error' || !lines.has(line)) lines.set(line, item.severity);
+  }
+  const decorations: monaco.editor.IModelDeltaDecoration[] = [...lines].map(([line, severity]) => ({
+    range: new monaco.Range(line, 1, line, 1),
+    options: {
+      isWholeLine: true,
+      linesDecorationsClassName: severity === 'error' ? 'diagnostic-line-error' : 'diagnostic-line-warning',
+      stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+    },
+  }));
+  const active = diagnostics[activeDiagnostic];
+  if (active) {
+    decorations.push({
+      range: new monaco.Range(active.marker.startLineNumber, 1, active.marker.startLineNumber, 1),
+      options: { isWholeLine: true, className: 'diagnostic-active-line' },
+    });
+  }
+  diagnosticDecorations.set(decorations);
+}
+
+function createDiagnosticItem(item: DiagnosticView, index: number): HTMLElement {
+  const wrapper = document.createElement('div');
+  wrapper.setAttribute('role', 'listitem');
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `diagnostic-item ${item.severity}`;
+  button.dataset.index = String(index);
+  button.title = `${formatLocation(item.marker)} · ${item.kind}\n${item.raw}`;
+  if (index === activeDiagnostic) button.classList.add('active');
+
+  const icon = document.createElement('span');
+  icon.className = 'diagnostic-icon';
+  icon.textContent = item.severity === 'error' ? '✕' : '⚠';
+  icon.setAttribute('aria-hidden', 'true');
+
+  const main = document.createElement('span');
+  main.className = 'diagnostic-main';
+
+  const message = document.createElement('span');
+  message.className = 'diagnostic-message';
+  message.textContent = item.message;
+
+  const meta = document.createElement('span');
+  meta.className = 'diagnostic-meta';
+  meta.textContent = `[${item.kind}] ${formatLocation(item.marker)}`;
+
+  main.append(message, meta);
+
+  if (item.raw && item.raw !== item.message) {
+    const raw = document.createElement('span');
+    raw.className = 'diagnostic-raw';
+    raw.textContent = item.raw;
+    main.append(raw);
+  }
+
+  button.append(icon, main);
+  button.addEventListener('click', () => focusDiagnostic(index));
+  wrapper.append(button);
+  return wrapper;
+}
+
+function renderDiagnostics() {
+  const validation = $('validation');
+  const errorText = $('errorText');
+  const errors = diagnostics.filter(item => item.severity === 'error').length;
+  const warnings = diagnostics.length - errors;
+
+  if (diagnosticsPending) {
+    validation.textContent = '… 校验中';
+    validation.className = 'validation pending';
+    errorText.textContent = '正在检查 JSON 语法…';
+  } else if (!errors && !warnings) {
+    validation.textContent = '✓ JSON 有效';
+    validation.className = 'validation good';
+    errorText.textContent = '无语法错误';
+  } else if (!errors) {
+    validation.textContent = `⚠ ${warnings} 个警告`;
+    validation.className = 'validation warn';
+    errorText.textContent = `${formatLocation(diagnostics[0].marker)}：${diagnostics[0].message}`;
+  } else {
+    validation.textContent = `✕ ${errors} 个错误`;
+    validation.className = 'validation bad';
+    errorText.textContent = `${formatLocation(diagnostics[0].marker)}：${diagnostics[0].message}`;
+  }
+
+  updateDiagnosticsSummary();
+  renderEditorDiagnosticDecorations();
+
+  const list = $('diagnosticsList');
+  list.textContent = '';
+  if (diagnosticsPending) {
+    const pending = document.createElement('div');
+    pending.className = 'diagnostics-empty pending';
+    pending.textContent = '正在校验当前文档…';
+    list.append(pending);
+    return;
+  }
+  if (!diagnostics.length) {
+    const empty = document.createElement('div');
+    empty.className = 'diagnostics-empty';
+    empty.textContent = '✓ 未发现问题';
+    list.append(empty);
+    return;
+  }
+  diagnostics.slice(0, MAX_RENDERED_DIAGNOSTICS)
+    .forEach((item, index) => list.append(createDiagnosticItem(item, index)));
+  if (diagnostics.length > MAX_RENDERED_DIAGNOSTICS) {
+    const more = document.createElement('div');
+    more.className = 'diagnostics-empty pending';
+    more.textContent = `还有 ${diagnostics.length - MAX_RENDERED_DIAGNOSTICS} 条问题未显示，请修复后再查看`;
+    list.append(more);
+  }
+}
+
+function setValidationPending() {
+  diagnostics = [];
+  activeDiagnostic = -1;
+  diagnosticsPending = true;
+  diagnosticsSignature = '';
+  renderDiagnostics();
+}
+
+function refreshDiagnostics() {
+  const next = collectDiagnostics();
+  const nextSignature = diagnosticsKey(next);
+  const wasPending = diagnosticsPending;
+  diagnosticsPending = false;
+  if (!wasPending && nextSignature === diagnosticsSignature) return;
+  diagnosticsSignature = nextSignature;
+  diagnostics = next;
+  activeDiagnostic = -1;
+  renderDiagnostics();
+}
+
+function scheduleDiagnosticsRefresh(delay = 120) {
+  window.clearTimeout(diagnosticsTimer);
+  diagnosticsTimer = window.setTimeout(refreshDiagnostics, delay);
+}
+
+function updateActiveDiagnosticClass() {
+  $('diagnosticsList').querySelectorAll<HTMLButtonElement>('.diagnostic-item').forEach(element => {
+    element.classList.toggle('active', Number(element.dataset.index) === activeDiagnostic);
+  });
+}
+
+function focusDiagnostic(index: number) {
+  const item = diagnostics[index];
+  if (!item) return;
+  const marker = item.marker;
+  // 零长度 range 无法形成可见选区，向右扩展一列。
+  const endColumn = marker.endLineNumber === marker.startLineNumber && marker.endColumn <= marker.startColumn
+    ? marker.startColumn + 1
+    : marker.endColumn;
+  const range = new monaco.Range(marker.startLineNumber, marker.startColumn, marker.endLineNumber, endColumn);
+  activeDiagnostic = index;
+  editor.setSelection(range);
+  editor.revealRangeInCenter(range, monaco.editor.ScrollType.Smooth);
+  editor.focus();
+  updateActiveDiagnosticClass();
+  renderEditorDiagnosticDecorations();
+  $('diagnosticsList')
+    .querySelector<HTMLElement>(`.diagnostic-item[data-index="${index}"]`)
+    ?.scrollIntoView({ block: 'nearest' });
+}
+
+function navigateDiagnostic(direction: 1 | -1) {
+  if (!diagnostics.length) return;
+  setDiagnosticsCollapsed(false);
+  const base = activeDiagnostic >= 0 && activeDiagnostic < diagnostics.length
+    ? activeDiagnostic
+    : (direction > 0 ? -1 : 0);
+  focusDiagnostic((base + direction + diagnostics.length) % diagnostics.length);
+}
+
+function setDiagnosticsCollapsed(collapsed: boolean) {
+  $('diagnosticsPanel').classList.toggle('is-collapsed', collapsed);
+  $('diagnosticsToggle').setAttribute('aria-expanded', String(!collapsed));
+  $('diagnosticsChevron').textContent = collapsed ? '▸' : '▾';
+}
+
+function toggleDiagnosticsPanel() {
+  setDiagnosticsCollapsed(!$('diagnosticsPanel').classList.contains('is-collapsed'));
+}
+
+// JSON worker 异步产出 marker，输入时立即读取会拿到上一次结果，因此这里以事件为准。
+monaco.editor.onDidChangeMarkers((resources) => {
+  const model = editor.getModel();
+  if (!model) return;
+  const current = model.uri.toString();
+  if (!resources.some(resource => resource.toString() === current)) return;
+  scheduleDiagnosticsRefresh(120);
+});
 
 function parseJson(): any {
   const raw = editor.getValue();
-  try { const value = JSON.parse(raw); status('JSON 校验通过', 'success'); return value; }
-  catch (e: any) { status(zhError(e, 'JSON 解析失败'), 'error'); throw e; }
+  try {
+    const value = JSON.parse(raw);
+    status('JSON 校验通过', 'success');
+    return value;
+  } catch (error) {
+    // 解析失败只用于阻止操作；行列位置仍取 Monaco 诊断，不解析 JSON.parse 的报错文本。
+    const first = diagnostics[0];
+    status(first
+      ? `JSON 解析失败：${formatLocation(first.marker)} ${first.message}`
+      : 'JSON 解析失败，请查看编辑器中的错误标记', 'error');
+    // worker 可能还没把最新 marker 推上来，稍后再刷新面板。
+    scheduleDiagnosticsRefresh(150);
+    throw error;
+  }
 }
-function applyText(text: string) { editor.setValue(text); editor.focus(); validateNow(); }
+function applyText(text: string) {
+  editor.setValue(text);
+  editor.focus();
+  setValidationPending();
+  scheduleDiagnosticsRefresh(600);
+}
 function formatJson() {
   try { const v = parseJson(); applyText(JSON.stringify(v, null, 2)); status('格式化完成', 'success'); }
   catch {}
@@ -228,4 +611,31 @@ $('format').onclick = formatJson; $('minify').onclick = minifyJson; $('compact')
 $('saveConfig').onclick = saveS3Config; $('refreshS3').onclick = listS3; $('pushS3').onclick = pushS3;
 $('region').onchange = () => { currentRegion = ($('region') as HTMLSelectElement).value as Region; updateBuckets(); ($('accessKey') as HTMLInputElement).value = ''; ($('secretKey') as HTMLInputElement).value = ''; loadS3Config(); };
 $('toggleSecret').onclick = () => { const el = $('secretKey') as HTMLInputElement; const show = el.type === 'password'; el.type = show ? 'text' : 'password'; $('toggleSecret').textContent = show ? '隐藏' : '显示'; };
-updateBuckets(); loadS3Config(); validateNow(); setDirty();
+function bindAction(id: string, handler: () => void) {
+  const element = $(id);
+  element.addEventListener('click', handler);
+  element.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      handler();
+    }
+  });
+}
+
+bindAction('diagnosticsToggle', toggleDiagnosticsPanel);
+const openFirstDiagnostic = () => {
+  setDiagnosticsCollapsed(false);
+  if (diagnostics.length) focusDiagnostic(0);
+};
+bindAction('validation', openFirstDiagnostic);
+bindAction('errorText', openFirstDiagnostic);
+window.addEventListener('keydown', (event) => {
+  if (event.key !== 'F8') return;
+  event.preventDefault();
+  if (!diagnostics.length) return;
+  navigateDiagnostic(event.shiftKey ? -1 : 1);
+});
+
+updateBuckets(); loadS3Config(); setDirty();
+setValidationPending();
+scheduleDiagnosticsRefresh(600);
