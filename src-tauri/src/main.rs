@@ -137,6 +137,26 @@ fn write_local_json_file(path: String, body: String) -> Result<(), String> {
 
 fn is_json_key(key: &str) -> bool { key.to_ascii_lowercase().ends_with(".json") }
 
+#[derive(Serialize)]
+struct StartupFile {
+    path: String,
+    content: String,
+}
+
+// 资源管理器双击 .json（文件关联）启动时，从命令行参数中取出 JSON 文件并读取内容。
+#[tauri::command]
+fn take_startup_file() -> Option<StartupFile> {
+    for arg in std::env::args().skip(1) {
+        let path = std::path::PathBuf::from(&arg);
+        if !path.is_file() { continue; }
+        if !path.to_string_lossy().to_ascii_lowercase().ends_with(".json") { continue; }
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let content = String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').to_string();
+        return Some(StartupFile { path: path.to_string_lossy().to_string(), content });
+    }
+    None
+}
+
 // 只读取对象元数据（ListObjectsV2），不下载任何文件内容。
 #[derive(Serialize)]
 struct S3Level {
@@ -326,7 +346,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![save_s3_credentials, credential_status, save_s3_preferences, load_s3_preferences, list_s3_level, search_s3_json, get_s3_object, put_s3_object, list_local_json_tree, read_local_json_file, write_local_json_file])
+        .invoke_handler(tauri::generate_handler![save_s3_credentials, credential_status, save_s3_preferences, load_s3_preferences, list_s3_level, search_s3_json, get_s3_object, put_s3_object, list_local_json_tree, read_local_json_file, write_local_json_file, take_startup_file])
         .run(tauri::generate_context!())
         .expect("应用启动失败");
 }

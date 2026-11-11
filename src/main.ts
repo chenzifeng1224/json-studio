@@ -9,6 +9,7 @@ import { open, save } from '@tauri-apps/plugin-dialog';
 
 type Region = 'global' | 'china';
 type AppMode = 'cloud' | 'local';
+const MODE_STORAGE_KEY = 'json-studio:mode';
 type S3Config = { region: Region; bucket: string; prefix: string; accessKey: string; secretKey: string };
 type LocalJsonEntry = { relative: string; absolute: string };
 type TreeNode = {
@@ -26,6 +27,10 @@ type TreeNode = {
 let editor: monaco.editor.IStandaloneCodeEditor;
 let currentFile: string | null = null;
 let currentObjectKey: string | null = null;
+// 每个模式各自缓存已打开文档，切换 Tab 时编辑区随之切换；未选择文件则显示空文档。
+type FileDoc = { ref: string; title: string; text: string; tag: string };
+let cloudDoc: FileDoc | null = null;
+let localDoc: FileDoc | null = null;
 let compactPaths: string[] = [];
 let currentRegion: Region = 'global';
 let currentBucket = '';
@@ -390,13 +395,68 @@ monaco.editor.defineTheme('json-studio-dark', {
   },
 });
 editor = monaco.editor.create($('editor'), {
-  value: '{\n  "示例": "你好，JSON Studio",\n  "items": [1, 2, 3]\n}',
+  value: '',
   language: 'json', theme: 'json-studio-dark', automaticLayout: true, minimap: { enabled: true },
   fontSize: 14, tabSize: 2, insertSpaces: true, wordWrap: 'on',
   bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, highlightActiveBracketPair: true },
   matchBrackets: 'always', padding: { top: 14, bottom: 14 }, scrollBeyondLastLine: false
 });
-editor.onDidChangeModelContent(() => { $('dirty').textContent = '● 有未保存修改'; });
+editor.onDidChangeModelContent(() => {
+  $('dirty').textContent = '● 有未保存修改';
+  const doc = currentDoc();
+  if (doc) doc.tag = '● 有未保存修改';
+});
+
+// Ctrl+F 查找替换面板：为各图标补充中文含义提示（原生 title），并屏蔽 Monaco 自带的英文悬浮提示，避免重复。
+const findIconHints: Array<[string, string]> = [
+  ['Previous Match', '上一个匹配'],
+  ['Next Match', '下一个匹配'],
+  ['Close', '关闭查找面板（Esc）'],
+  ['Replace All', '替换全部匹配'],
+  ['Replace', '替换当前匹配'],
+  ['Toggle Replace', '展开 / 收起替换框'],
+  ['Match Case', '区分大小写'],
+  ['Match Whole Word', '全字匹配'],
+  ['Use Regular Expression', '使用正则表达式'],
+  ['Preserve Case', '替换时保留原文大小写'],
+  ['Find in Selection', '只在选中的文本中查找'],
+  ['Toggle Search Scope', '只在选中的文本中查找'],
+];
+const findIconSelector = '.find-widget [role="button"], .find-widget [role="checkbox"]';
+function decorateFindWidget() {
+  const editorDom = editor.getDomNode();
+  const root = editorDom?.querySelector('.find-widget');
+  if (!root) return;
+  root.querySelectorAll<HTMLElement>('[role="button"], [role="checkbox"]').forEach((icon) => {
+    const label = icon.getAttribute('aria-label') || '';
+    const hint = findIconHints.find(([prefix]) => label.startsWith(prefix))?.[1];
+    if (hint && icon.getAttribute('title') !== hint) icon.setAttribute('title', hint);
+  });
+}
+{
+  const editorDom = editor.getDomNode();
+  if (editorDom) {
+    const blockHover = (event: Event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest(findIconSelector)) event.stopPropagation();
+    };
+    editorDom.addEventListener('mouseover', blockHover, true);
+    editorDom.addEventListener('mousemove', blockHover, true);
+    let scheduled = false;
+    const observer = new MutationObserver((mutations) => {
+      const touched = mutations.some((mutation) => {
+        const element = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+        if (element?.closest('.find-widget')) return true;
+        return Array.from(mutation.addedNodes).some((node) => node instanceof Element
+          && (node.matches('.find-widget') || !!node.querySelector('.find-widget')));
+      });
+      if (!touched || scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => { scheduled = false; decorateFindWidget(); });
+    });
+    observer.observe(editorDom, { childList: true, subtree: true });
+  }
+}
 // 光标位置变化时高亮匹配的两端括号（仅更新装饰，不移动视口、不改变光标）
 const bracketDecorations = editor.createDecorationsCollection();
 // Monaco 0.52 没有公开 findMatchingBracket，这里用字符串感知的括号配对实现，
@@ -732,6 +792,110 @@ function parseJson(): any {
     throw error;
   }
 }
+function currentDoc(): FileDoc | null { return mode === 'cloud' ? cloudDoc : localDoc; }
+// 切换 Tab / 打开新文件前，把编辑器里的实时内容写回当前模式的文档缓存。
+function snapshotDoc() {
+  const doc = currentDoc();
+  if (doc) doc.text = editor.getValue();
+}
+function storeDoc(docMode: AppMode, ref: string, title: string, text: string, tag: string): FileDoc {
+  const doc: FileDoc = { ref, title, text, tag };
+  if (docMode === 'cloud') {
+    cloudDoc = doc;
+    currentObjectKey = ref;
+    currentFile = null;
+  } else {
+    localDoc = doc;
+    currentFile = ref;
+    currentObjectKey = null;
+  }
+  if (mode === docMode) {
+    $('fileName').textContent = title;
+    $('dirty').textContent = tag;
+  }
+  return doc;
+}
+function showEmptyEditor() {
+  currentFile = null;
+  currentObjectKey = null;
+  $('fileName').textContent = '未打开文件';
+  editor.setValue('');
+  $('dirty').textContent = '● 未命名';
+  setValidationPending();
+  scheduleDiagnosticsRefresh(300);
+}
+// 编辑器内容跟随当前模式：有选中的文件则显示该文件，没有则为空文档。
+function syncEditorToMode() {
+  const doc = currentDoc();
+  if (!doc) { showEmptyEditor(); return; }
+  currentFile = mode === 'local' ? doc.ref : null;
+  currentObjectKey = mode === 'cloud' ? doc.ref : null;
+  // setValue 会触发内容变更事件并改写 tag，这里先取出原 tag，写入后恢复。
+  const tag = doc.tag;
+  editor.setValue(doc.text);
+  doc.tag = tag;
+  $('fileName').textContent = doc.title;
+  $('dirty').textContent = tag;
+  setValidationPending();
+  scheduleDiagnosticsRefresh(300);
+}
+// 定位顶层 "version" 数字值的位置，只替换该数字，避免保存时重排整份 JSON。
+function findTopLevelVersionRange(text: string): { start: number; end: number } | null {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      if (depth !== 1) { inString = true; continue; }
+      let end = i + 1;
+      let key = '';
+      while (end < text.length) {
+        const c = text[end];
+        if (c === '\\') { key += text.slice(end, end + 2); end += 2; continue; }
+        if (c === '"') break;
+        key += c;
+        end++;
+      }
+      if (key === 'version') {
+        let cursor = end + 1;
+        while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
+        if (text[cursor] === ':') {
+          cursor++;
+          while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
+          const start = cursor;
+          if (text[cursor] === '-' || /\d/.test(text[cursor])) {
+            cursor++;
+            while (cursor < text.length && /[0-9eE+.\-]/.test(text[cursor])) cursor++;
+            return { start, end: cursor };
+          }
+        }
+      }
+      i = end;
+      continue;
+    }
+    if (char === '{' || char === '[') depth++;
+    else if (char === '}' || char === ']') depth--;
+  }
+  return null;
+}
+// 保存/推送时若顶层 version 是数值则 +1，其余情况保持原文本不变。
+function bumpVersion(text: string): { text: string; bumped: boolean } {
+  let value: any;
+  try { value = JSON.parse(text); } catch { return { text, bumped: false }; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { text, bumped: false };
+  if (typeof value.version !== 'number' || !Number.isFinite(value.version)) return { text, bumped: false };
+  const range = findTopLevelVersionRange(text);
+  if (!range) return { text, bumped: false };
+  const next = value.version + 1;
+  return { text: text.slice(0, range.start) + String(next) + text.slice(range.end), bumped: true };
+}
 function applyText(text: string) {
   editor.setValue(text);
   editor.focus();
@@ -746,25 +910,62 @@ function minifyJson() {
   try { const v = parseJson(); applyText(JSON.stringify(v)); status('压缩完成', 'success'); }
   catch {}
 }
+const DEFAULT_COMPACT_KEYS = 'pointCoordinates,sceneinfo,editColorScenes';
+const CN_PUNCT_MAP: Record<string, string> = {
+  '，': ',', '。': '.', '：': ':', '；': ';', '“': '"', '”': '"', '‘': "'", '’': "'",
+  '（': '(', '）': ')', '【': '[', '】': ']', '、': ',', '！': '!', '？': '?', '《': '<', '》': '>', '　': ' ',
+};
+const CN_PUNCT_RE = /[，。：；\u201c\u201d\u2018\u2019（）【】、！？《》\u3000]/g;
+function convertCnPunctuation(text: string): string {
+  return text.replace(CN_PUNCT_RE, char => CN_PUNCT_MAP[char] ?? char);
+}
+function normalizeKeyList(input: string): string[] {
+  return convertCnPunctuation(input).split(',').map(key => key.trim()).filter(Boolean);
+}
+// 键名命中时的压缩规则：二维纯数组整行；三维数组每个二维数组一行；对象数组每个对象一行；其余不压缩。
+function compressMatchedArray(value: any[], indent: string): string | null {
+  if (!value.length) return null;
+  const inner = indent + '  ';
+  if (value.every(item => Array.isArray(item) && item.every(cell => Array.isArray(cell)))) {
+    return '[\n' + value.map(row => inner + JSON.stringify(row)).join(',\n') + '\n' + indent + ']';
+  }
+  if (value.every(item => Array.isArray(item))) return JSON.stringify(value);
+  if (value.every(item => item && typeof item === 'object' && !Array.isArray(item))) {
+    return '[\n' + value.map(item => inner + JSON.stringify(item)).join(',\n') + '\n' + indent + ']';
+  }
+  return null;
+}
+function stringifyWithCompaction(value: any, indent: string, key: string | undefined, keys: Set<string>, stats: { matched: number; compressed: number }): string {
+  if (Array.isArray(value)) {
+    const compressed = key && keys.has(key) ? compressMatchedArray(value, indent) : null;
+    if (compressed !== null) { stats.compressed += 1; return compressed; }
+    if (!value.length) return '[]';
+    const inner = indent + '  ';
+    return '[\n' + value.map(item => inner + stringifyWithCompaction(item, inner, undefined, keys, stats)).join(',\n') + '\n' + indent + ']';
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value);
+    if (!entries.length) return '{}';
+    const inner = indent + '  ';
+    return '{\n' + entries.map(([childKey, childValue]) => {
+      if (keys.has(childKey)) stats.matched += 1;
+      return inner + JSON.stringify(childKey) + ': ' + stringifyWithCompaction(childValue, inner, childKey, keys, stats);
+    }).join(',\n') + '\n' + indent + '}';
+  }
+  return JSON.stringify(value);
+}
 function compactAtPath() {
-  const path = ($('compactPath') as HTMLInputElement).value.trim();
-  if (!path) return status('请输入路径，例如 data.items 或 $.data.items', 'error');
+  const input = $('compactPath') as HTMLInputElement;
+  const keys = normalizeKeyList(input.value);
+  if (!keys.length) return status('请输入键名，多个键名用英文逗号分隔', 'error');
   try {
-    const root = parseJson(); const parts = path.replace(/^\$\.?/, '').split('.').filter(Boolean);
-    let node = root;
-    for (const part of parts) {
-      const m = part.match(/^([^[]+)|\[(\d+)\]$/g);
-      if (part.startsWith('[')) node = node[Number(part.slice(1,-1))];
-      else node = node?.[part];
-    }
-    if (node === undefined) return status('路径不存在', 'error');
-    const replacement = JSON.stringify(node);
-    const needle = JSON.stringify(node, null, 2);
-    const source = editor.getValue();
-    const index = source.indexOf(needle);
-    if (index < 0) return status('无法唯一定位该节点，请先格式化 JSON 后重试', 'error');
-    applyText(source.slice(0,index) + replacement + source.slice(index + needle.length));
-    status(`已压缩节点：${path}`, 'success');
+    const root = parseJson();
+    const stats = { matched: 0, compressed: 0 };
+    const output = stringifyWithCompaction(root, '', undefined, new Set(keys), stats);
+    if (!stats.matched) return status(`未找到匹配的键名：${keys.join(', ')}`, 'error');
+    if (!stats.compressed) return status(`匹配到 ${stats.matched} 个键名，但对应值不是可压缩的数组`, 'error');
+    applyText(output);
+    status(`已压缩 ${stats.compressed} 处数组节点（键名：${keys.join(', ')}）`, 'success');
   } catch {}
 }
 async function openLocal() {
@@ -773,13 +974,21 @@ async function openLocal() {
   try {
     const text = await invoke<string>('read_local_json_file', { path: selected });
     applyText(text);
-    currentFile = selected;
-    currentObjectKey = null;
-    $('fileName').textContent = baseName(selected);
-    setDirty();
-    setMode('local');
+    storeDoc('local', selected, baseName(selected), text, '● 本地文件');
     status('本地文件已打开', 'success');
   } catch (e) { status(zhError(e, '打开本地文件失败'), 'error'); }
+}
+// 资源管理器双击 .json 打开时，从启动参数载入文件（等同“打开本地 JSON”选择该文件）。
+async function openStartupFile(): Promise<boolean> {
+  try {
+    const file = await invoke<{ path: string; content: string } | null>('take_startup_file');
+    if (!file) return false;
+    setMode('local');
+    applyText(file.content);
+    storeDoc('local', file.path, baseName(file.path), file.content, '● 本地文件');
+    status(`已打开：${baseName(file.path)}`, 'success');
+    return true;
+  } catch { return false; }
 }
 async function saveLocal() {
   try {
@@ -788,10 +997,20 @@ async function saveLocal() {
     if (!path) path = await save({ filters: [{ name: 'JSON 文件', extensions: ['json'] }], defaultPath: 'data.json' });
     if (!path) return;
     if (!path.toLowerCase().endsWith('.json')) path += '.json';
-    await invoke('write_local_json_file', { path, body: editor.getValue() });
+    const bumped = bumpVersion(editor.getValue());
+    await invoke('write_local_json_file', { path, body: bumped.text });
+    if (bumped.bumped) applyText(bumped.text);
     currentFile = path; currentObjectKey = null;
+    if (localDoc) {
+      localDoc.ref = path;
+      localDoc.title = baseName(path);
+      localDoc.text = bumped.text;
+      localDoc.tag = '● 已保存';
+    } else {
+      storeDoc('local', path, baseName(path), bumped.text, '● 已保存');
+    }
     $('fileName').textContent = baseName(path); $('dirty').textContent = '● 已保存';
-    status('本地保存成功', 'success');
+    status(bumped.bumped ? '本地保存成功，version 已 +1' : '本地保存成功', 'success');
     if (mode === 'local') renderTree();
   } catch (e: any) {
     if (e instanceof SyntaxError) return;
@@ -1068,31 +1287,59 @@ async function loadS3Object(key: string) {
   try {
     const value = await invoke<string>('get_s3_object', { region: currentRegion, bucket: currentBucket, key });
     applyText(value);
-    currentObjectKey = key;
-    currentFile = null;
-    $('fileName').textContent = key;
-    $('dirty').textContent = '● 云端文件';
+    storeDoc('cloud', key, key, value, '● 云端文件');
     status('云端 JSON 已载入', 'success');
     renderTree();
     highlightActiveTreeRow();
   } catch (e) { status(zhError(e, '读取云端文件失败'), 'error'); }
 }
 async function pushS3() {
+  const button = $('pushS3') as HTMLButtonElement;
+  if (button.disabled) return;
   if (!currentObjectKey) return status('请先从云端列表打开一个 JSON 文件', 'error');
   if (!currentBucket) return status('请先配置 S3 存储桶', 'error');
+  let payload: { text: string; bumped: boolean };
   try {
     parseJson();
-    await invoke('put_s3_object', { region: currentRegion, bucket: currentBucket, key: currentObjectKey, body: editor.getValue() });
+    payload = bumpVersion(editor.getValue());
+  } catch { return; }
+  button.disabled = true;
+  button.classList.remove('is-success');
+  button.textContent = '推送中...';
+  try {
+    await invoke('put_s3_object', { region: currentRegion, bucket: currentBucket, key: currentObjectKey, body: payload.text });
+    if (payload.bumped) applyText(payload.text);
+    if (cloudDoc) { cloudDoc.text = payload.text; cloudDoc.tag = '● 已同步'; }
     $('dirty').textContent = '● 已同步';
-    status('已覆盖保存到 S3 原位置', 'success');
+    status(payload.bumped ? '已覆盖保存到 S3，version 已 +1' : '已覆盖保存到 S3 原位置', 'success');
+    button.classList.add('is-success');
+    button.textContent = '推送成功';
+    window.setTimeout(() => {
+      button.classList.remove('is-success');
+      button.textContent = '推送覆盖 S3 原文件';
+      button.disabled = false;
+    }, 2000);
   } catch (e: any) {
-    if (e instanceof SyntaxError) return;
+    button.textContent = '推送覆盖 S3 原文件';
+    button.disabled = false;
     status(zhError(e.message || e, '推送覆盖失败'), 'error');
   }
 }
 
+function closeCurrentFile() {
+  if (mode === 'cloud') cloudDoc = null;
+  else localDoc = null;
+  showEmptyEditor();
+  renderTree();
+  highlightActiveTreeRow();
+  status('已关闭当前文件');
+}
+
 function setMode(next: AppMode) {
+  const changed = mode !== next;
+  if (changed) snapshotDoc();
   mode = next;
+  localStorage.setItem(MODE_STORAGE_KEY, next);
   document.body.dataset.mode = next;
   const cloudTab = $('tabCloud');
   const localTab = $('tabLocal');
@@ -1102,6 +1349,7 @@ function setMode(next: AppMode) {
   localTab.setAttribute('aria-selected', String(next === 'local'));
   $('cloudPanel').hidden = next !== 'cloud';
   $('localPanel').hidden = next !== 'local';
+  if (changed) syncEditorToMode();
   renderTree();
 }
 
@@ -1116,10 +1364,7 @@ async function openLocalTreeFile(node: TreeNode) {
   try {
     const text = await invoke<string>('read_local_json_file', { path: node.fullPath });
     applyText(text);
-    currentFile = node.fullPath;
-    currentObjectKey = null;
-    $('fileName').textContent = node.name;
-    $('dirty').textContent = '● 本地文件';
+    storeDoc('local', node.fullPath, node.name, text, '● 本地文件');
     status('本地 JSON 已载入', 'success');
     renderTree();
     highlightActiveTreeRow();
@@ -1203,25 +1448,64 @@ function closeS3ConfigModal() {
 
 function showCompactPaths() {
   try {
-    const value = parseJson(); const paths: string[] = [];
-    const walk = (v: any, p: string) => {
-      if (Array.isArray(v) || (v && typeof v === 'object')) {
-        paths.push(p || '$');
-        if (Array.isArray(v)) v.forEach((x,i) => walk(x, `${p}[${i}]`));
-        else Object.keys(v).forEach(k => walk(v[k], p ? `${p}.${k}` : k));
+    const value = parseJson();
+    const names = new Set<string>();
+    const walk = (node: any) => {
+      if (Array.isArray(node)) node.forEach(walk);
+      else if (node && typeof node === 'object') {
+        for (const [key, child] of Object.entries(node)) {
+          if (Array.isArray(child)) names.add(key);
+          walk(child);
+        }
       }
     };
-    walk(value, ''); compactPaths = paths;
-    $('pathList').innerHTML = paths.map(p => `<button class="path" data-path="${esc(p)}">${esc(p)}</button>`).join('');
-    document.querySelectorAll<HTMLButtonElement>('.path').forEach(b => b.onclick = () => { ($('compactPath') as HTMLInputElement).value = b.dataset.path!; compactAtPath(); });
-    status(`发现 ${paths.length} 个对象/数组节点`, 'success');
+    walk(value);
+    compactPaths = [...names];
+    $('pathList').innerHTML = compactPaths.map(name => `<button class="path" data-path="${esc(name)}">${esc(name)}</button>`).join('');
+    document.querySelectorAll<HTMLButtonElement>('.path').forEach(b => b.onclick = () => {
+      const keys = normalizeKeyList(compactInput.value);
+      const name = b.dataset.path!;
+      if (!keys.includes(name)) keys.push(name);
+      compactInput.value = keys.join(',');
+      compactAtPath();
+    });
+    status(`发现 ${compactPaths.length} 个数组键名`, 'success');
   } catch {}
 }
 $('openLocal').onclick = openLocal;
 $('saveLocal').onclick = saveLocal;
+$('closeFile').onclick = closeCurrentFile;
 $('format').onclick = formatJson;
 $('minify').onclick = minifyJson;
 $('compact').onclick = compactAtPath;
+const compactInput = $('compactPath') as HTMLInputElement;
+compactInput.value = DEFAULT_COMPACT_KEYS;
+// 输入框内中文逗号/顿号自动转英文逗号，光标位置保持不变
+compactInput.addEventListener('input', () => {
+  const raw = compactInput.value;
+  const converted = convertCnPunctuation(raw);
+  if (converted === raw) return;
+  const caret = compactInput.selectionStart ?? converted.length;
+  compactInput.value = converted;
+  compactInput.setSelectionRange(caret, caret);
+});
+// 编辑区输入中文标点时自动替换为英文标点（JSON 仅支持英文符号）
+(editor as any).onDidType?.((typed: string) => {
+  const converted = convertCnPunctuation(typed);
+  if (!typed || converted === typed) return;
+  const model = editor.getModel();
+  const position = editor.getPosition();
+  if (!model || !position) return;
+  const endOffset = model.getOffsetAt(position);
+  const startOffset = Math.max(0, endOffset - typed.length);
+  const start = model.getPositionAt(startOffset);
+  editor.executeEdits('cn-punctuation', [{
+    range: new monaco.Range(start.lineNumber, start.column, position.lineNumber, position.column),
+    text: converted,
+    forceMoveMarkers: true,
+  }]);
+  editor.setPosition(model.getPositionAt(startOffset + converted.length));
+});
 $('scanPaths').onclick = showCompactPaths;
 $('pushS3').onclick = pushS3;
 $('tabCloud').onclick = () => setMode('cloud');
@@ -1317,7 +1601,9 @@ updateBuckets();
 setDirty();
 setValidationPending();
 scheduleDiagnosticsRefresh(600);
-void loadS3Config().then((configured) => {
-  setMode('cloud');
-  if (configured && currentBucket) void listS3();
+void loadS3Config().then(async (configured) => {
+  if (await openStartupFile()) return;
+  const savedMode: AppMode = localStorage.getItem(MODE_STORAGE_KEY) === 'local' ? 'local' : 'cloud';
+  setMode(savedMode);
+  if (savedMode === 'cloud' && configured && currentBucket) void listS3();
 });

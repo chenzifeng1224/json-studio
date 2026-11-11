@@ -1,16 +1,27 @@
 <!doctype html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>JSON Studio · JSON 编辑器</title></head>
-<body><div id="app"><div class="app">
+<body data-mode="cloud"><div id="app"><div class="app">
   <header class="topbar">
     <div class="logo">◈ <span>JSON</span> STUDIO</div>
     <div class="mode-tabs" role="tablist" aria-label="文件来源">
       <button id="tabCloud" class="mode-tab active" type="button" role="tab" aria-selected="true" aria-controls="cloudPanel">云端</button>
       <button id="tabLocal" class="mode-tab" type="button" role="tab" aria-selected="false" aria-controls="localPanel">本地</button>
     </div>
-    <div id="fileName" class="filename">未打开文件</div><div class="spacer"></div>
-    <button class="btn" id="openLocal">打开本地 JSON</button>
-    <button class="btn primary" id="saveLocal">保存本地</button>
+    <div class="filename-group">
+      <div id="fileName" class="filename">未打开文件</div>
+      <button class="file-close" id="closeFile" type="button" aria-label="关闭当前文件" title="关闭当前文件">✕</button>
+    </div>
+    <div class="top-tools">
+      <button class="btn" id="format">格式化 JSON</button>
+      <button class="btn" id="minify">整体压缩</button>
+      <input id="compactPath" class="compact-input" placeholder="键名，多个用英文逗号分隔" title="按键名压缩：多个键名用英文逗号分隔">
+      <button class="btn" id="compact">压缩指定节点</button>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn primary cloud-only" id="pushS3">推送覆盖 S3 原文件</button>
+    <button class="btn local-only" id="openLocal">打开本地 JSON</button>
+    <button class="btn primary local-only" id="saveLocal">保存本地</button>
   </header>
   <div class="workspace">
     <aside class="sidebar">
@@ -51,12 +62,6 @@
       <section class="panel"><h3>⌘ 对象 / 数组路径</h3><button class="btn" id="scanPaths" style="width:100%">扫描当前 JSON 节点</button><div id="pathList" class="path-list" style="margin-top:8px"></div><div class="hint">点击路径即可将对应对象或数组压缩为一行。</div></section>
     </aside>
     <main class="main">
-      <div class="toolbar">
-        <button class="btn" id="format">格式化 JSON</button><button class="btn" id="minify">整体压缩</button>
-        <input id="compactPath" class="compact-input" placeholder="路径：$.data.items 或 list[0]">
-        <button class="btn" id="compact">压缩指定节点</button>
-        <div class="spacer"></div><button class="btn primary cloud-only" id="pushS3">推送覆盖 S3 原文件</button>
-      </div>
       <div class="editor-wrap"><div id="editor" class="editor"></div></div>
       <section id="diagnosticsPanel" class="diagnostics" aria-label="问题诊断">
         <div id="diagnosticsToggle" class="diagnostics-header" role="button" tabindex="0" aria-expanded="true" aria-controls="diagnosticsBody">
