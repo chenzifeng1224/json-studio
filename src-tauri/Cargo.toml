@@ -1,6 +1,6 @@
 [package]
 name = "tauri-json-studio"
-version = "1.0.2"
+version = "1.0.3"
 description = "本地 JSON 编辑器，支持 S3 云端对象"
 authors = ["JSON Studio"]
 edition = "2021"

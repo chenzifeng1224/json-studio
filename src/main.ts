@@ -4,22 +4,202 @@ import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import jsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker';
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
-import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 
 (self as any).MonacoEnvironment = { getWorker(_: string, label: string) { return label === 'json' ? new jsonWorker() : new editorWorker(); } };
 
 type Region = 'global' | 'china';
+type AppMode = 'cloud' | 'local';
 type S3Config = { region: Region; bucket: string; prefix: string; accessKey: string; secretKey: string };
+type LocalJsonEntry = { relative: string; absolute: string };
+type TreeNode = {
+  name: string;
+  displayPath: string;
+  fullPath: string;
+  kind: 'folder' | 'file';
+  children: TreeNode[];
+  expanded: boolean;
+};
 let editor: monaco.editor.IStandaloneCodeEditor;
 let currentFile: string | null = null;
 let currentObjectKey: string | null = null;
 let compactPaths: string[] = [];
 let currentRegion: Region = 'global';
+let currentBucket = '';
+let currentPrefix = '';
+let mode: AppMode = 'cloud';
+let cloudTreeRoot: TreeNode | null = null;
+let localTreeRoot: TreeNode | null = null;
+let localRootPath: string | null = null;
+let localRootName = '';
+let cloudLoading = false;
+let localLoading = false;
+let cloudTreeNotice = '';
+let localTreeNotice = '';
+let configReturnFocus: HTMLElement | null = null;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const status = (message: string, kind = '') => { $('status').textContent = message; $('status').className = `status ${kind}`; };
 const setDirty = () => $('dirty').textContent = currentFile || currentObjectKey ? '● 已载入' : '● 未命名';
 const esc = (s: string) => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
+const baseName = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() || path;
+
+function countFiles(node: TreeNode | null): number {
+  if (!node) return 0;
+  if (node.kind === 'file') return 1;
+  return node.children.reduce((sum, child) => sum + countFiles(child), 0);
+}
+
+function buildTree(entries: { displayPath: string; fullPath: string }[]): TreeNode[] {
+  const roots: TreeNode[] = [];
+  const folders = new Map<string, TreeNode>();
+  const files = new Set<string>();
+
+  for (const entry of entries) {
+    const parts = entry.displayPath.split('/').filter(Boolean);
+    if (!parts.length) continue;
+    let children = roots;
+    let prefix = '';
+    for (let index = 0; index < parts.length; index++) {
+      const name = parts[index];
+      prefix = prefix ? `${prefix}/${name}` : name;
+      if (index === parts.length - 1) {
+        if (files.has(prefix)) continue;
+        files.add(prefix);
+        children.push({ name, displayPath: prefix, fullPath: entry.fullPath, kind: 'file', children: [], expanded: false });
+      } else {
+        let folder = folders.get(prefix);
+        if (!folder) {
+          folder = { name, displayPath: prefix, fullPath: prefix, kind: 'folder', children: [], expanded: true };
+          folders.set(prefix, folder);
+          children.push(folder);
+        }
+        children = folder.children;
+      }
+    }
+  }
+
+  const sortNodes = (nodes: TreeNode[]) => {
+    nodes.sort((a, b) => a.kind === b.kind
+      ? a.name.localeCompare(b.name, 'zh-CN')
+      : (a.kind === 'folder' ? -1 : 1));
+    nodes.forEach(node => sortNodes(node.children));
+  };
+  sortNodes(roots);
+  return roots;
+}
+
+function treeContainer(target: AppMode): HTMLElement {
+  return $(target === 'cloud' ? 'cloudTree' : 'localTree');
+}
+
+function setTreeMessage(target: AppMode, text: string, kind = '') {
+  const container = treeContainer(target);
+  container.textContent = '';
+  const element = document.createElement('div');
+  element.className = kind ? `empty ${kind}` : 'empty';
+  element.textContent = text;
+  container.append(element);
+}
+
+function updateCloudContext() {
+  const count = countFiles(cloudTreeRoot);
+  const prefix = currentPrefix.replace(/\/+$/, '');
+  const label = currentBucket ? `${currentBucket}${prefix ? ` / ${prefix}` : ''}` : '未配置 S3';
+  const context = $('cloudContext');
+  context.textContent = cloudLoading ? '正在拉取…' : (count ? `${label} · ${count} 个 JSON` : label);
+  context.classList.toggle('error', !currentBucket);
+}
+
+function updateLocalContext() {
+  const count = countFiles(localTreeRoot);
+  const context = $('localContext');
+  context.textContent = localLoading ? '正在扫描…' : (localRootName ? `${localRootName}${count ? ` · ${count} 个 JSON` : ''}` : '未选择文件夹');
+  context.classList.toggle('error', false);
+}
+
+function updateTreeContext() {
+  updateCloudContext();
+  updateLocalContext();
+}
+
+function isTreeFileActive(node: TreeNode): boolean {
+  if (node.kind !== 'file') return false;
+  return mode === 'cloud' ? node.fullPath === currentObjectKey : node.fullPath === currentFile;
+}
+
+function renderTreeNode(container: HTMLElement, node: TreeNode, depth: number) {
+  const isFolder = node.kind === 'folder';
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = `tree-row ${node.kind}${depth === 0 ? ' is-root' : ''}`;
+  row.style.paddingLeft = `${8 + depth * 14}px`;
+  row.title = node.fullPath || node.displayPath || node.name;
+  if (!isFolder && isTreeFileActive(node)) row.classList.add('active');
+  if (isFolder) row.setAttribute('aria-expanded', String(node.expanded));
+
+  const marker = document.createElement('span');
+  marker.className = isFolder ? 'tree-chevron' : 'tree-file-dot';
+  marker.textContent = isFolder ? (node.expanded ? '▾' : '▸') : '•';
+  marker.setAttribute('aria-hidden', 'true');
+
+  const name = document.createElement('span');
+  name.className = 'tree-name';
+  name.textContent = node.name;
+  row.append(marker, name);
+
+  row.addEventListener('click', () => {
+    if (isFolder) {
+      node.expanded = !node.expanded;
+      renderTree();
+    } else {
+      void openTreeFile(node);
+    }
+  });
+  container.append(row);
+
+  if (!isFolder || !node.expanded) return;
+  if (!node.children.length) {
+    const empty = document.createElement('div');
+    empty.className = 'tree-empty';
+    empty.style.paddingLeft = `${8 + (depth + 1) * 14}px`;
+    empty.textContent = '没有 JSON 文件';
+    container.append(empty);
+    return;
+  }
+  node.children.forEach(child => renderTreeNode(container, child, depth + 1));
+}
+
+function renderTree() {
+  if (mode === 'cloud' && cloudLoading && !cloudTreeRoot) {
+    setTreeMessage('cloud', '正在拉取云端 JSON…', 'pending');
+    updateTreeContext();
+    return;
+  }
+  if (mode === 'local' && localLoading && !localTreeRoot) {
+    setTreeMessage('local', '正在扫描本地 JSON…', 'pending');
+    updateTreeContext();
+    return;
+  }
+
+  const container = treeContainer(mode);
+  container.textContent = '';
+  const root = mode === 'cloud' ? cloudTreeRoot : localTreeRoot;
+  if (!root) {
+    const notice = mode === 'cloud' ? cloudTreeNotice : localTreeNotice;
+    const fallback = mode === 'cloud'
+      ? (currentBucket ? '点击“刷新”拉取云端 JSON 列表' : '尚未配置 S3，点击“配置”填写存储桶与密钥')
+      : (localRootPath ? '点击“刷新”重新扫描' : '点击“打开文件夹”选择目录');
+    setTreeMessage(mode, notice || fallback, notice ? 'error' : '');
+    updateTreeContext();
+    return;
+  }
+  renderTreeNode(container, root, 0);
+  updateTreeContext();
+}
+
+function highlightActiveTreeRow() {
+  treeContainer(mode).querySelector<HTMLElement>('.tree-row.active')?.scrollIntoView({ block: 'nearest' });
+}
 
 // 浏览器 JSON.parse 报错、Monaco JSON 诊断、AWS SDK / 系统底层错误均为英文。
 // 按关键词确定性映射为中文；未命中的保留英文原文作为技术详情，避免丢失排错信息。
@@ -530,66 +710,303 @@ function compactAtPath() {
 async function openLocal() {
   const selected = await open({ multiple: false, filters: [{ name: 'JSON 文件', extensions: ['json'] }] });
   if (!selected || Array.isArray(selected)) return;
-  try { applyText(await readTextFile(selected)); currentFile = selected; currentObjectKey = null; $('fileName').textContent = selected.split(/[\\/]/).pop()!; setDirty(); status('本地文件已打开', 'success'); }
-  catch (e) { status(zhError(e, '打开本地文件失败'), 'error'); }
+  try {
+    const text = await invoke<string>('read_local_json_file', { path: selected });
+    applyText(text);
+    currentFile = selected;
+    currentObjectKey = null;
+    $('fileName').textContent = baseName(selected);
+    setDirty();
+    setMode('local');
+    status('本地文件已打开', 'success');
+  } catch (e) { status(zhError(e, '打开本地文件失败'), 'error'); }
 }
 async function saveLocal() {
-  try { parseJson(); let path = currentFile;
+  try {
+    parseJson();
+    let path = currentFile;
     if (!path) path = await save({ filters: [{ name: 'JSON 文件', extensions: ['json'] }], defaultPath: 'data.json' });
     if (!path) return;
-    await writeTextFile(path, editor.getValue()); currentFile = path; currentObjectKey = null;
-    $('fileName').textContent = path.split(/[\\/]/).pop()!; $('dirty').textContent = '● 已保存'; status('本地保存成功', 'success');
-  } catch (e: any) { if (e?.message) status(zhError(e, '保存本地文件失败'), 'error'); }
+    if (!path.toLowerCase().endsWith('.json')) path += '.json';
+    await invoke('write_local_json_file', { path, body: editor.getValue() });
+    currentFile = path; currentObjectKey = null;
+    $('fileName').textContent = baseName(path); $('dirty').textContent = '● 已保存';
+    status('本地保存成功', 'success');
+    if (mode === 'local') renderTree();
+  } catch (e: any) {
+    if (e instanceof SyntaxError) return;
+    if (e?.message) status(zhError(e, '保存本地文件失败'), 'error');
+  }
 }
 function configFromUI(): S3Config {
-  return { region: currentRegion, bucket: ($('bucket') as HTMLSelectElement).value, prefix: ($('prefix') as HTMLInputElement).value.trim(), accessKey: ($('accessKey') as HTMLInputElement).value.trim(), secretKey: ($('secretKey') as HTMLInputElement).value };
+  return {
+    region: ($('region') as HTMLSelectElement).value as Region,
+    bucket: ($('bucket') as HTMLSelectElement).value,
+    prefix: ($('prefix') as HTMLInputElement).value.trim(),
+    accessKey: ($('accessKey') as HTMLInputElement).value.trim(),
+    secretKey: ($('secretKey') as HTMLInputElement).value,
+  };
 }
-async function saveS3Config() {
-  const c = configFromUI();
-  if (!c.bucket) return status('请选择存储桶（Bucket）', 'error');
+function updateCredentialHint(configured: boolean) {
+  const hint = $('credentialHint');
+  hint.textContent = configured ? '已配置凭据（系统凭据库）' : '尚未配置凭据；保存时需填写访问密钥 ID 与私有访问密钥。';
+  hint.className = configured ? 'hint good' : 'hint';
+}
+function setConfigNote(message: string, kind = '') {
+  const note = $('configNote');
+  note.textContent = message;
+  note.className = kind ? `config-note ${kind}` : 'config-note';
+}
+async function refreshCredentialHint(region: Region): Promise<boolean> {
   try {
-    if (c.accessKey && c.secretKey) await invoke('save_s3_credentials', { region: c.region, accessKey: c.accessKey, secretKey: c.secretKey });
-    else if (c.accessKey || c.secretKey) return status('访问密钥 ID 与私有访问密钥需同时填写', 'error');
-    await invoke('save_s3_preferences', { region: c.region, bucket: c.bucket, prefix: c.prefix });
-    const configured = await invoke<boolean>('credential_status', { region: c.region });
-    $('credentialHint').textContent = configured ? '已配置凭据（系统凭据库）' : '尚未配置凭据';
-    status(configured ? '配置已保存到本机' : '区域配置已保存，请填写密钥', 'success');
+    const configured = await invoke<boolean>('credential_status', { region });
+    updateCredentialHint(configured);
+    return configured;
+  } catch {
+    updateCredentialHint(false);
+    return false;
   }
-  catch(e) { status(zhError(e, '保存配置失败'), 'error'); }
 }
-async function loadS3Config() {
+async function saveS3Config(): Promise<boolean> {
+  const c = configFromUI();
+  setConfigNote('正在保存配置…');
+  if (!c.bucket) {
+    setConfigNote('请选择存储桶（Bucket）', 'error');
+    status('请选择存储桶（Bucket）', 'error');
+    return false;
+  }
+  if (c.accessKey || c.secretKey) {
+    if (!c.accessKey || !c.secretKey) {
+      const message = '访问密钥 ID 与私有访问密钥需同时填写';
+      setConfigNote(message, 'error');
+      status(message, 'error');
+      return false;
+    }
+  }
+  try {
+    if (c.accessKey && c.secretKey) {
+      await invoke('save_s3_credentials', { region: c.region, accessKey: c.accessKey, secretKey: c.secretKey });
+      ($('accessKey') as HTMLInputElement).value = '';
+      ($('secretKey') as HTMLInputElement).value = '';
+    }
+    await invoke('save_s3_preferences', { region: c.region, bucket: c.bucket, prefix: c.prefix });
+    currentRegion = c.region;
+    currentBucket = c.bucket;
+    currentPrefix = c.prefix;
+    updateBuckets(currentRegion, currentBucket);
+    updateCloudContext();
+    const configured = await refreshCredentialHint(currentRegion);
+    if (!configured) {
+      setConfigNote('区域配置已保存，请填写访问密钥后再拉取', 'error');
+      status('区域配置已保存，请填写访问密钥后再拉取', 'error');
+      return false;
+    }
+    setConfigNote('S3 配置已保存', 'good');
+    status('S3 配置已保存', 'success');
+    return true;
+  } catch (e) {
+    const message = zhError(e, '保存配置失败');
+    setConfigNote(message, 'error');
+    status(message, 'error');
+    return false;
+  }
+}
+async function loadS3Config(): Promise<boolean> {
   try {
     const c = await invoke<any>('load_s3_preferences');
-    if (c) { currentRegion = c.region || 'global'; ($('region') as HTMLSelectElement).value = currentRegion; ($('prefix') as HTMLInputElement).value = c.prefix || ''; updateBuckets(); ($('bucket') as HTMLSelectElement).value = c.bucket || ''; }
-    const keys = await invoke<any>('credential_status', { region: currentRegion });
-    $('credentialHint').textContent = keys ? '已配置凭据（系统凭据库）' : '尚未配置凭据';
-  } catch {}
+    currentRegion = (c?.region as Region) || 'global';
+    currentPrefix = c?.prefix || '';
+    ($('region') as HTMLSelectElement).value = currentRegion;
+    ($('prefix') as HTMLInputElement).value = currentPrefix;
+    updateBuckets(currentRegion, c?.bucket || '');
+    currentBucket = ($('bucket') as HTMLSelectElement).value || '';
+    const configured = await refreshCredentialHint(currentRegion);
+    updateCloudContext();
+    return configured;
+  } catch {
+    updateCredentialHint(false);
+    updateCloudContext();
+    return false;
+  }
 }
-function updateBuckets() {
-  const opts = currentRegion === 'global' ? ['hellofairyapp'] : ['hellofairyfile','hellofairyapp'];
-  $('bucket').innerHTML = opts.map(x => `<option value="${x}">${x}</option>`).join('');
+function updateBuckets(region: Region = currentRegion, selected = '') {
+  const opts = region === 'global' ? ['hellofairyapp'] : ['hellofairyfile','hellofairyapp'];
+  if (selected && !opts.includes(selected)) opts.unshift(selected);
+  const select = $('bucket') as HTMLSelectElement;
+  select.innerHTML = opts.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join('');
+  select.value = selected && opts.includes(selected) ? selected : opts[0];
 }
 async function listS3() {
-  const c = configFromUI();
+  if (cloudLoading) return;
+  if (!currentBucket) {
+    openS3ConfigModal();
+    status('请先配置 S3 存储桶', 'error');
+    return;
+  }
+  cloudLoading = true;
+  cloudTreeNotice = '';
+  status('正在拉取云端 JSON 列表…');
+  renderTree();
+  updateTreeContext();
   try {
-    if (c.accessKey && c.secretKey) await saveS3Config();
-    else await invoke('save_s3_preferences', { region: c.region, bucket: c.bucket, prefix: c.prefix });
-    const keys = await invoke<string[]>('list_json_objects', { region: c.region, bucket: c.bucket, prefix: c.prefix });
-    $('objectList').innerHTML = keys.map(k => `<button class="object" data-key="${esc(k)}">${esc(k)}</button>`).join('') || '<div class="empty">该路径下没有 JSON 文件</div>';
-    document.querySelectorAll<HTMLButtonElement>('.object').forEach(b => b.onclick = () => loadS3Object(b.dataset.key!));
+    const keys = await invoke<string[]>('list_json_objects', { region: currentRegion, bucket: currentBucket, prefix: currentPrefix });
+    cloudTreeRoot = {
+      name: currentBucket,
+      displayPath: '',
+      fullPath: currentBucket,
+      kind: 'folder',
+      expanded: true,
+      children: buildTree(keys.map(key => ({ displayPath: key, fullPath: key }))),
+    };
     status(`找到 ${keys.length} 个 JSON 文件`, 'success');
-  } catch(e) { status(zhError(e, '拉取 JSON 列表失败'), 'error'); }
+  } catch (e) {
+    const message = zhError(e, '拉取云端列表失败');
+    status(message, 'error');
+    cloudTreeNotice = message;
+    if (String(e).includes('尚未保存')) openS3ConfigModal();
+  } finally {
+    cloudLoading = false;
+    renderTree();
+    if (mode === 'cloud') highlightActiveTreeRow();
+  }
 }
 async function loadS3Object(key: string) {
-  const c = configFromUI();
-  try { const value = await invoke<string>('get_s3_object', { region: c.region, bucket: c.bucket, key }); applyText(value); currentObjectKey = key; currentFile = null; $('fileName').textContent = key; $('dirty').textContent = '● 云端文件'; status('云端 JSON 已载入', 'success'); }
-  catch(e) { status(zhError(e, '读取云端文件失败'), 'error'); }
+  try {
+    const value = await invoke<string>('get_s3_object', { region: currentRegion, bucket: currentBucket, key });
+    applyText(value);
+    currentObjectKey = key;
+    currentFile = null;
+    $('fileName').textContent = key;
+    $('dirty').textContent = '● 云端文件';
+    status('云端 JSON 已载入', 'success');
+    renderTree();
+    highlightActiveTreeRow();
+  } catch (e) { status(zhError(e, '读取云端文件失败'), 'error'); }
 }
 async function pushS3() {
-  if (!currentObjectKey) return status('请先从 S3 列表打开一个 JSON 文件', 'error');
-  try { parseJson(); const c = configFromUI(); await invoke('put_s3_object', { region: c.region, bucket: c.bucket, key: currentObjectKey, body: editor.getValue() }); $('dirty').textContent = '● 已同步'; status('已覆盖保存到 S3 原位置', 'success'); }
-  catch(e: any) { status(zhError(e.message || e, '推送覆盖失败'), 'error'); }
+  if (!currentObjectKey) return status('请先从云端列表打开一个 JSON 文件', 'error');
+  if (!currentBucket) return status('请先配置 S3 存储桶', 'error');
+  try {
+    parseJson();
+    await invoke('put_s3_object', { region: currentRegion, bucket: currentBucket, key: currentObjectKey, body: editor.getValue() });
+    $('dirty').textContent = '● 已同步';
+    status('已覆盖保存到 S3 原位置', 'success');
+  } catch (e: any) {
+    if (e instanceof SyntaxError) return;
+    status(zhError(e.message || e, '推送覆盖失败'), 'error');
+  }
 }
+
+function setMode(next: AppMode) {
+  mode = next;
+  document.body.dataset.mode = next;
+  const cloudTab = $('tabCloud');
+  const localTab = $('tabLocal');
+  cloudTab.classList.toggle('active', next === 'cloud');
+  localTab.classList.toggle('active', next === 'local');
+  cloudTab.setAttribute('aria-selected', String(next === 'cloud'));
+  localTab.setAttribute('aria-selected', String(next === 'local'));
+  $('cloudPanel').hidden = next !== 'cloud';
+  $('localPanel').hidden = next !== 'local';
+  renderTree();
+}
+
+async function openTreeFile(node: TreeNode) {
+  if (node.kind !== 'file') return;
+  if (mode === 'cloud') await loadS3Object(node.fullPath);
+  else await openLocalTreeFile(node);
+}
+
+async function openLocalTreeFile(node: TreeNode) {
+  if (node.kind !== 'file') return;
+  try {
+    const text = await invoke<string>('read_local_json_file', { path: node.fullPath });
+    applyText(text);
+    currentFile = node.fullPath;
+    currentObjectKey = null;
+    $('fileName').textContent = node.name;
+    $('dirty').textContent = '● 本地文件';
+    status('本地 JSON 已载入', 'success');
+    renderTree();
+    highlightActiveTreeRow();
+  } catch (e) { status(zhError(e, '读取本地文件失败'), 'error'); }
+}
+
+async function openLocalFolder() {
+  try {
+    const selected = await open({ directory: true, multiple: false, title: '选择包含 JSON 的文件夹' });
+    if (!selected || Array.isArray(selected)) return;
+    localRootPath = selected;
+    localRootName = baseName(selected);
+    localTreeRoot = null;
+    localTreeNotice = '';
+    setMode('local');
+    await loadLocalTree();
+  } catch (e) { status(zhError(e, '打开文件夹失败'), 'error'); }
+}
+
+async function loadLocalTree() {
+  if (!localRootPath) {
+    await openLocalFolder();
+    return;
+  }
+  if (localLoading) return;
+  const rootPath = localRootPath;
+  localLoading = true;
+  localTreeNotice = '';
+  status('正在扫描本地 JSON 文件…');
+  updateLocalContext();
+  renderTree();
+  try {
+    const entries = await invoke<LocalJsonEntry[]>('list_local_json_tree', { root: rootPath });
+    localTreeRoot = {
+      name: localRootName || baseName(rootPath),
+      displayPath: '',
+      fullPath: rootPath,
+      kind: 'folder',
+      expanded: true,
+      children: buildTree(entries.map(entry => ({ displayPath: entry.relative, fullPath: entry.absolute }))),
+    };
+    status(entries.length ? `找到 ${entries.length} 个 JSON 文件` : '该文件夹中没有 JSON 文件', entries.length ? 'success' : '');
+  } catch (e) {
+    const message = zhError(e, '扫描本地文件夹失败');
+    status(message, 'error');
+    localTreeNotice = message;
+  } finally {
+    localLoading = false;
+    renderTree();
+    if (mode === 'local') highlightActiveTreeRow();
+  }
+}
+
+function openS3ConfigModal() {
+  const modal = $('configModal');
+  if (!modal.hidden) return;
+  configReturnFocus = document.activeElement as HTMLElement | null;
+  // 每次打开都回填已保存的配置，取消时不会留下未保存的临时选择。
+  ($('region') as HTMLSelectElement).value = currentRegion;
+  updateBuckets(currentRegion, currentBucket);
+  ($('prefix') as HTMLInputElement).value = currentPrefix;
+  ($('accessKey') as HTMLInputElement).value = '';
+  ($('secretKey') as HTMLInputElement).value = '';
+  ($('secretKey') as HTMLInputElement).type = 'password';
+  $('toggleSecret').textContent = '显示';
+  setConfigNote('');
+  modal.hidden = false;
+  void refreshCredentialHint(currentRegion);
+  requestAnimationFrame(() => ($('accessKey') as HTMLInputElement).focus());
+}
+
+function closeS3ConfigModal() {
+  const modal = $('configModal');
+  if (modal.hidden) return;
+  modal.hidden = true;
+  ($('accessKey') as HTMLInputElement).value = '';
+  ($('secretKey') as HTMLInputElement).value = '';
+  configReturnFocus?.focus();
+  configReturnFocus = null;
+}
+
 function showCompactPaths() {
   try {
     const value = parseJson(); const paths: string[] = [];
@@ -606,10 +1023,46 @@ function showCompactPaths() {
     status(`发现 ${paths.length} 个对象/数组节点`, 'success');
   } catch {}
 }
-$('openLocal').onclick = openLocal; $('saveLocal').onclick = saveLocal;
-$('format').onclick = formatJson; $('minify').onclick = minifyJson; $('compact').onclick = compactAtPath; $('scanPaths').onclick = showCompactPaths;
-$('saveConfig').onclick = saveS3Config; $('refreshS3').onclick = listS3; $('pushS3').onclick = pushS3;
-$('region').onchange = () => { currentRegion = ($('region') as HTMLSelectElement).value as Region; updateBuckets(); ($('accessKey') as HTMLInputElement).value = ''; ($('secretKey') as HTMLInputElement).value = ''; loadS3Config(); };
+$('openLocal').onclick = openLocal;
+$('saveLocal').onclick = saveLocal;
+$('format').onclick = formatJson;
+$('minify').onclick = minifyJson;
+$('compact').onclick = compactAtPath;
+$('scanPaths').onclick = showCompactPaths;
+$('pushS3').onclick = pushS3;
+$('tabCloud').onclick = () => setMode('cloud');
+$('tabLocal').onclick = () => setMode('local');
+$('openS3Config').onclick = openS3ConfigModal;
+$('closeS3Config').onclick = closeS3ConfigModal;
+$('cancelS3Config').onclick = closeS3ConfigModal;
+$('refreshS3').onclick = listS3;
+$('openLocalFolder').onclick = openLocalFolder;
+$('refreshLocal').onclick = loadLocalTree;
+$('saveConfig').onclick = async () => {
+  if (!(await saveS3Config())) return;
+  closeS3ConfigModal();
+  setMode('cloud');
+  await listS3();
+};
+$('configModal').querySelectorAll<HTMLElement>('[data-close="true"]').forEach(el => el.addEventListener('click', closeS3ConfigModal));
+$('configModal').addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') { event.preventDefault(); closeS3ConfigModal(); return; }
+  if (event.key !== 'Tab') return;
+  const focusables = Array.from($('configModal').querySelectorAll<HTMLElement>('button, select, input'));
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+});
+$('region').onchange = () => {
+  const region = ($('region') as HTMLSelectElement).value as Region;
+  updateBuckets(region);
+  ($('accessKey') as HTMLInputElement).value = '';
+  ($('secretKey') as HTMLInputElement).value = '';
+  setConfigNote('');
+  void refreshCredentialHint(region);
+};
 $('toggleSecret').onclick = () => { const el = $('secretKey') as HTMLInputElement; const show = el.type === 'password'; el.type = show ? 'text' : 'password'; $('toggleSecret').textContent = show ? '隐藏' : '显示'; };
 function bindAction(id: string, handler: () => void) {
   const element = $(id);
@@ -636,6 +1089,11 @@ window.addEventListener('keydown', (event) => {
   navigateDiagnostic(event.shiftKey ? -1 : 1);
 });
 
-updateBuckets(); loadS3Config(); setDirty();
+updateBuckets();
+setDirty();
 setValidationPending();
 scheduleDiagnosticsRefresh(600);
+void loadS3Config().then((configured) => {
+  setMode('cloud');
+  if (configured && currentBucket) void listS3();
+});

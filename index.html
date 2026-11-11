@@ -4,23 +4,42 @@
 <body><div id="app"><div class="app">
   <header class="topbar">
     <div class="logo">◈ <span>JSON</span> STUDIO</div>
+    <div class="mode-tabs" role="tablist" aria-label="文件来源">
+      <button id="tabCloud" class="mode-tab active" type="button" role="tab" aria-selected="true" aria-controls="cloudPanel">云端</button>
+      <button id="tabLocal" class="mode-tab" type="button" role="tab" aria-selected="false" aria-controls="localPanel">本地</button>
+    </div>
     <div id="fileName" class="filename">未打开文件</div><div class="spacer"></div>
     <button class="btn" id="openLocal">打开本地 JSON</button>
     <button class="btn primary" id="saveLocal">保存本地</button>
   </header>
   <div class="workspace">
     <aside class="sidebar">
-      <section class="panel">
-        <h3>☁ S3 云端连接</h3>
-        <div class="field"><label>存储区域</label><select id="region"><option value="global">AWS 国际区 · us-east-1</option><option value="china">AWS 中国区 · cn-north-1</option></select></div>
-        <div class="field"><label>访问密钥 ID（Access Key ID）</label><input id="accessKey" autocomplete="off" placeholder="请输入访问密钥 ID"></div>
-        <div class="field"><label>私有访问密钥（Secret Access Key）</label><div class="secret-row"><input id="secretKey" type="password" autocomplete="new-password" placeholder="请输入私有访问密钥"><button id="toggleSecret">显示</button></div></div>
-        <div class="field"><label>存储桶（Bucket）</label><select id="bucket"></select></div>
-        <div class="field"><label>路径前缀（Prefix，可选）</label><input id="prefix" placeholder="例如 configs/"></div>
-        <div class="row"><button class="btn" id="saveConfig">保存配置</button><button class="btn primary" id="refreshS3">拉取 JSON 列表</button></div>
-        <div class="hint" id="credentialHint">密钥保存在操作系统凭据库，不写入普通配置文件。</div>
+      <section id="cloudPanel" class="panel">
+        <div class="sidebar-head">
+          <div class="sidebar-head-text">
+            <h3>☁ 云端 JSON</h3>
+            <div id="cloudContext" class="sidebar-context">正在读取配置…</div>
+          </div>
+          <div class="sidebar-actions">
+            <button class="mini-btn" id="openS3Config" type="button">配置</button>
+            <button class="mini-btn" id="refreshS3" type="button">刷新</button>
+          </div>
+        </div>
+        <div id="cloudTree" class="file-tree"><div class="empty">正在读取 S3 配置…</div></div>
       </section>
-      <section class="panel"><h3>☷ JSON 对象列表</h3><div id="objectList" class="object-list"><div class="empty">连接 S3 后拉取 JSON 文件</div></div></section>
+      <section id="localPanel" class="panel" hidden>
+        <div class="sidebar-head">
+          <div class="sidebar-head-text">
+            <h3>⌂ 本地 JSON</h3>
+            <div id="localContext" class="sidebar-context">未选择文件夹</div>
+          </div>
+          <div class="sidebar-actions">
+            <button class="mini-btn" id="openLocalFolder" type="button">打开文件夹</button>
+            <button class="mini-btn" id="refreshLocal" type="button">刷新</button>
+          </div>
+        </div>
+        <div id="localTree" class="file-tree"><div class="empty">点击“打开文件夹”选择目录</div></div>
+      </section>
       <section class="panel"><h3>⌘ 对象 / 数组路径</h3><button class="btn" id="scanPaths" style="width:100%">扫描当前 JSON 节点</button><div id="pathList" class="path-list" style="margin-top:8px"></div><div class="hint">点击路径即可将对应对象或数组压缩为一行。</div></section>
     </aside>
     <main class="main">
@@ -28,7 +47,7 @@
         <button class="btn" id="format">格式化 JSON</button><button class="btn" id="minify">整体压缩</button>
         <input id="compactPath" class="compact-input" placeholder="路径：$.data.items 或 list[0]">
         <button class="btn" id="compact">压缩指定节点</button>
-        <div class="spacer"></div><button class="btn primary" id="pushS3">推送覆盖 S3 原文件</button>
+        <div class="spacer"></div><button class="btn primary cloud-only" id="pushS3">推送覆盖 S3 原文件</button>
       </div>
       <div class="editor-wrap"><div id="editor" class="editor"></div></div>
       <section id="diagnosticsPanel" class="diagnostics" aria-label="问题诊断">
@@ -45,6 +64,28 @@
       </section>
       <footer class="bottom"><span id="validation" class="validation good" role="button" tabindex="0" title="点击打开问题诊断">✓ JSON 有效</span><span id="errorText" class="error-text" role="button" tabindex="0" title="点击定位到第一个问题">无语法错误</span><span id="dirty">● 未命名</span><span id="status" class="status">就绪</span></footer>
     </main>
+  </div>
+  <div id="configModal" class="modal" hidden>
+    <div class="modal-backdrop" data-close="true"></div>
+    <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="configTitle">
+      <div class="modal-head">
+        <h2 id="configTitle">S3 云端配置</h2>
+        <button class="modal-close" id="closeS3Config" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="field"><label>存储区域</label><select id="region"><option value="global">AWS 国际区 · us-east-1</option><option value="china">AWS 中国区 · cn-north-1</option></select></div>
+        <div class="field"><label>访问密钥 ID（Access Key ID）</label><input id="accessKey" autocomplete="off" placeholder="请输入访问密钥 ID"></div>
+        <div class="field"><label>私有访问密钥（Secret Access Key）</label><div class="secret-row"><input id="secretKey" type="password" autocomplete="new-password" placeholder="请输入私有访问密钥"><button id="toggleSecret" type="button">显示</button></div></div>
+        <div class="field"><label>存储桶（Bucket）</label><select id="bucket"></select></div>
+        <div class="field"><label>路径前缀（Prefix，可选）</label><input id="prefix" placeholder="例如 configs/"></div>
+        <div class="hint" id="credentialHint">密钥保存在操作系统凭据库，不写入普通配置文件。</div>
+        <div id="configNote" class="config-note" role="status" aria-live="polite"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" id="cancelS3Config" type="button">取消</button>
+        <button class="btn primary" id="saveConfig" type="button">保存并拉取</button>
+      </div>
+    </div>
   </div>
 </div></div><script type="module" src="/src/main.ts"></script></body>
 </html>

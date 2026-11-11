@@ -79,6 +79,59 @@ async fn s3_client(region: RegionChoice) -> Result<Client, String> {
     Ok(Client::from_conf(builder.build()))
 }
 
+#[derive(Serialize)]
+struct LocalJsonEntry {
+    relative: String,
+    absolute: String,
+}
+
+fn collect_local_json_files(dir: &std::path::Path, rel: &str, out: &mut Vec<LocalJsonEntry>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("读取文件夹失败：{e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取文件夹项失败：{e}"))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| format!("读取文件类型失败：{e}"))?;
+        if file_type.is_symlink() { continue; }
+        let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        if file_type.is_dir() {
+            // 跳过明显无关且可能非常庞大的目录；其余子目录读取失败时继续扫描。
+            if name == "node_modules" || name == "target" || name == ".git" { continue; }
+            let _ = collect_local_json_files(&path, &child_rel, out);
+            if out.len() > 10000 { return Err("JSON 文件超过 10000 个，请选择更小的文件夹".into()); }
+        } else if file_type.is_file() && name.to_ascii_lowercase().ends_with(".json") {
+            out.push(LocalJsonEntry { relative: child_rel, absolute: path.to_string_lossy().to_string() });
+            if out.len() > 10000 { return Err("JSON 文件超过 10000 个，请选择更小的文件夹".into()); }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn list_local_json_tree(root: String) -> Result<Vec<LocalJsonEntry>, String> {
+    let path = std::path::PathBuf::from(&root);
+    if !path.is_dir() { return Err("所选路径不是文件夹".into()); }
+    let mut output = Vec::new();
+    collect_local_json_files(&path, "", &mut output)?;
+    output.sort_by(|a, b| a.relative.to_lowercase().cmp(&b.relative.to_lowercase()));
+    Ok(output)
+}
+
+#[tauri::command]
+fn read_local_json_file(path: String) -> Result<String, String> {
+    if !path.to_ascii_lowercase().ends_with(".json") { return Err("仅允许读取 .json 文件".into()); }
+    let bytes = fs::read(&path).map_err(|e| format!("读取本地文件失败：{e}"))?;
+    let text = String::from_utf8(bytes).map_err(|e| format!("文件不是有效 UTF-8：{e}"))?;
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
+
+#[tauri::command]
+fn write_local_json_file(path: String, body: String) -> Result<(), String> {
+    if !path.to_ascii_lowercase().ends_with(".json") { return Err("仅允许写入 .json 文件".into()); }
+    serde_json::from_str::<serde_json::Value>(&body).map_err(|e| format!("JSON 校验失败：{e}"))?;
+    fs::write(&path, body).map_err(|e| format!("写入本地文件失败：{e}"))
+}
+
 #[tauri::command]
 async fn list_json_objects(region: RegionChoice, bucket: String, prefix: String) -> Result<Vec<String>, String> {
     let client = s3_client(region).await?;
@@ -126,7 +179,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![save_s3_credentials, credential_status, save_s3_preferences, load_s3_preferences, list_json_objects, get_s3_object, put_s3_object])
+        .invoke_handler(tauri::generate_handler![save_s3_credentials, credential_status, save_s3_preferences, load_s3_preferences, list_json_objects, get_s3_object, put_s3_object, list_local_json_tree, read_local_json_file, write_local_json_file])
         .run(tauri::generate_context!())
         .expect("应用启动失败");
 }
