@@ -92,7 +92,7 @@ function highlightMatchingBracket() {
   const col = pos.column - 1;
   const pairs: Record<string,string> = { '{':'}', '[':']', '}':'{', ']':'[' };
   const ch = line[col] || line[col - 1];
-  if (!ch || !pairs[ch]) { editor.setDecorations(bracketDecoration, []); return; }
+  if (!ch || !pairs[ch]) { bracketDecoration.set([]); return; }
   const offset = model.getOffsetAt({ lineNumber: pos.lineNumber, column: ch === line[col] ? col + 1 : col });
   const text = model.getValue(); const openChar = ch === '{' || ch === '[' ? ch : pairs[ch];
   const closeChar = pairs[openChar]; let depth = 0, match = -1, direction = ch === openChar ? 1 : -1;
@@ -102,10 +102,10 @@ function highlightMatchingBracket() {
     if (c === closeChar) depth += direction === 1 ? -1 : 1;
     if (depth === 0) { match = i; break; }
   }
-  if (match < 0) { editor.setDecorations(bracketDecoration, []); return; }
+  if (match < 0) { bracketDecoration.set([]); return; }
   const a = model.getPositionAt(offset - (direction === 1 ? 0 : 1));
   const b = model.getPositionAt(match);
-  editor.setDecorations(bracketDecoration, [a,b].map(p => ({ range: new monaco.Range(p.lineNumber,p.column,p.lineNumber,p.column+1), options: { inlineClassName: 'bracket-match-strong', overviewRuler: { color: '#ffd166', position: monaco.editor.OverviewRulerLane.Center } } })));
+  bracketDecoration.set([a,b].map(p => ({ range: new monaco.Range(p.lineNumber,p.column,p.lineNumber,p.column+1), options: { inlineClassName: 'bracket-match-strong', overviewRuler: { color: '#ffd166', position: monaco.editor.OverviewRulerLane.Center } } })));
 }
 const bracketDecoration = editor.createDecorationsCollection([]);
 
@@ -152,7 +152,7 @@ async function openLocal() {
 }
 async function saveLocal() {
   try { parseJson(); let path = currentFile;
-    if (!path) path = await save({ filters: [{ name: 'JSON 文件', extensions: ['json'] }], defaultPath: 'data.json' }) || undefined;
+    if (!path) path = await save({ filters: [{ name: 'JSON 文件', extensions: ['json'] }], defaultPath: 'data.json' });
     if (!path) return;
     await writeTextFile(path, editor.getValue()); currentFile = path; currentObjectKey = null;
     $('fileName').textContent = path.split(/[\\/]/).pop()!; $('dirty').textContent = '● 已保存'; status('本地保存成功', 'success');
@@ -177,7 +177,7 @@ async function saveS3Config() {
 async function loadS3Config() {
   try {
     const c = await invoke<any>('load_s3_preferences');
-    if (c) { currentRegion = c.region || 'global'; $('region').value = currentRegion; $('prefix').value = c.prefix || ''; updateBuckets(); $('bucket').value = c.bucket || ''; }
+    if (c) { currentRegion = c.region || 'global'; ($('region') as HTMLSelectElement).value = currentRegion; ($('prefix') as HTMLInputElement).value = c.prefix || ''; updateBuckets(); ($('bucket') as HTMLSelectElement).value = c.bucket || ''; }
     const keys = await invoke<any>('credential_status', { region: currentRegion });
     $('credentialHint').textContent = keys ? '已配置凭据（系统凭据库）' : '尚未配置凭据';
   } catch {}
@@ -226,6 +226,6 @@ function showCompactPaths() {
 $('openLocal').onclick = openLocal; $('saveLocal').onclick = saveLocal;
 $('format').onclick = formatJson; $('minify').onclick = minifyJson; $('compact').onclick = compactAtPath; $('scanPaths').onclick = showCompactPaths;
 $('saveConfig').onclick = saveS3Config; $('refreshS3').onclick = listS3; $('pushS3').onclick = pushS3;
-$('region').onchange = () => { currentRegion = ($('region') as HTMLSelectElement).value as Region; updateBuckets(); $('accessKey').value = ''; $('secretKey').value = ''; loadS3Config(); };
+$('region').onchange = () => { currentRegion = ($('region') as HTMLSelectElement).value as Region; updateBuckets(); ($('accessKey') as HTMLInputElement).value = ''; ($('secretKey') as HTMLInputElement).value = ''; loadS3Config(); };
 $('toggleSecret').onclick = () => { const el = $('secretKey') as HTMLInputElement; const show = el.type === 'password'; el.type = show ? 'text' : 'password'; $('toggleSecret').textContent = show ? '隐藏' : '显示'; };
 updateBuckets(); loadS3Config(); validateNow(); setDirty();
