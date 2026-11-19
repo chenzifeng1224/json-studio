@@ -3,7 +3,8 @@ import * as monaco from 'monaco-editor';
 import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import jsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker';
 import { invoke } from '@tauri-apps/api/core';
-import { open, save } from '@tauri-apps/plugin-dialog';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { ask, open, save } from '@tauri-apps/plugin-dialog';
 
 (self as any).MonacoEnvironment = { getWorker(_: string, label: string) { return label === 'json' ? new jsonWorker() : new editorWorker(); } };
 
@@ -1597,6 +1598,30 @@ window.addEventListener('keydown', (event) => {
   navigateDiagnostic(event.shiftKey ? -1 : 1);
 });
 
+const isDirty = () => ($('dirty').textContent || '').includes('有未保存修改');
+// Ctrl+S 保存：云端模式推送到 S3，本地模式保存到本地文件；撤销/重做沿用编辑器默认的 Ctrl+Z、Ctrl+Shift+Z
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+  if (e.key.toLowerCase() !== 's') return;
+  e.preventDefault();
+  if (mode === 'cloud') void pushS3(); else void saveLocal();
+});
+// 关闭窗口时检测未保存修改，有则弹窗确认
+const mainWindow = getCurrentWindow();
+let closeConfirmed = false;
+void mainWindow.onCloseRequested(async (event) => {
+  if (closeConfirmed || !isDirty()) return;
+  event.preventDefault();
+  const confirmed = await ask('当前 JSON 有未保存的修改，直接退出将丢失这些内容。仍要退出吗？', {
+    title: '未保存的修改',
+    kind: 'warning',
+    okLabel: '退出',
+    cancelLabel: '取消',
+  });
+  if (!confirmed) return;
+  closeConfirmed = true;
+  void mainWindow.close();
+});
 updateBuckets();
 setDirty();
 setValidationPending();
