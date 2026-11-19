@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "JSON Studio 默认权限配置",
   "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-close", "dialog:allow-open", "dialog:allow-save", "dialog:allow-ask", "fs:allow-read-text-file", "fs:allow-write-text-file"]
+  "permissions": ["core:default", "core:window:allow-close", "core:window:allow-destroy", "dialog:allow-open", "dialog:allow-save", "dialog:allow-ask", "fs:allow-read-text-file", "fs:allow-write-text-file"]
 }

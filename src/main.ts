@@ -1612,15 +1612,20 @@ let closeConfirmed = false;
 void mainWindow.onCloseRequested(async (event) => {
   if (closeConfirmed || !isDirty()) return;
   event.preventDefault();
-  const confirmed = await ask('当前 JSON 有未保存的修改，直接退出将丢失这些内容。仍要退出吗？', {
-    title: '未保存的修改',
-    kind: 'warning',
-    okLabel: '退出',
-    cancelLabel: '取消',
-  });
+  let confirmed = false;
+  try {
+    confirmed = await ask('当前 JSON 有未保存的修改，直接退出将丢失这些内容。仍要退出吗？', {
+      title: '未保存的修改',
+      kind: 'warning',
+      okLabel: '退出',
+      cancelLabel: '取消',
+    });
+  } catch {
+    confirmed = true;
+  }
   if (!confirmed) return;
   closeConfirmed = true;
-  void mainWindow.close();
+  void mainWindow.destroy();
 });
 updateBuckets();
 setDirty();
