@@ -991,12 +991,12 @@ async function openStartupFile(): Promise<boolean> {
     return true;
   } catch { return false; }
 }
-async function saveLocal() {
+async function saveLocal(): Promise<boolean> {
   try {
     parseJson();
     let path = currentFile;
     if (!path) path = await save({ filters: [{ name: 'JSON 文件', extensions: ['json'] }], defaultPath: 'data.json' });
-    if (!path) return;
+    if (!path) return false;
     if (!path.toLowerCase().endsWith('.json')) path += '.json';
     const bumped = bumpVersion(editor.getValue());
     await invoke('write_local_json_file', { path, body: bumped.text });
@@ -1013,9 +1013,11 @@ async function saveLocal() {
     $('fileName').textContent = baseName(path); $('dirty').textContent = '● 已保存';
     status(bumped.bumped ? '本地保存成功，version 已 +1' : '本地保存成功', 'success');
     if (mode === 'local') renderTree();
+    return true;
   } catch (e: any) {
-    if (e instanceof SyntaxError) return;
+    if (e instanceof SyntaxError) return false;
     if (e?.message) status(zhError(e, '保存本地文件失败'), 'error');
+    return false;
   }
 }
 function configFromUI(): S3Config {
@@ -1294,16 +1296,16 @@ async function loadS3Object(key: string) {
     highlightActiveTreeRow();
   } catch (e) { status(zhError(e, '读取云端文件失败'), 'error'); }
 }
-async function pushS3() {
+async function pushS3(): Promise<boolean> {
   const button = $('pushS3') as HTMLButtonElement;
-  if (button.disabled) return;
-  if (!currentObjectKey) return status('请先从云端列表打开一个 JSON 文件', 'error');
-  if (!currentBucket) return status('请先配置 S3 存储桶', 'error');
+  if (button.disabled) return false;
+  if (!currentObjectKey) { status('请先从云端列表打开一个 JSON 文件', 'error'); return false; }
+  if (!currentBucket) { status('请先配置 S3 存储桶', 'error'); return false; }
   let payload: { text: string; bumped: boolean };
   try {
     parseJson();
     payload = bumpVersion(editor.getValue());
-  } catch { return; }
+  } catch { return false; }
   button.disabled = true;
   button.classList.remove('is-success');
   button.textContent = '推送中...';
@@ -1320,10 +1322,12 @@ async function pushS3() {
       button.textContent = '推送覆盖 S3 原文件';
       button.disabled = false;
     }, 2000);
+    return true;
   } catch (e: any) {
     button.textContent = '推送覆盖 S3 原文件';
     button.disabled = false;
     status(zhError(e.message || e, '推送覆盖失败'), 'error');
+    return false;
   }
 }
 
@@ -1608,24 +1612,27 @@ document.addEventListener('keydown', (e) => {
 });
 // 关闭窗口时检测未保存修改，有则弹窗确认
 const mainWindow = getCurrentWindow();
-let closeConfirmed = false;
+// 关闭窗口：统一由前端接管，退出时走后端 exit_app，避免依赖窗口 destroy 权限
 void mainWindow.onCloseRequested(async (event) => {
-  if (closeConfirmed || !isDirty()) return;
   event.preventDefault();
-  let confirmed = false;
+  // 编辑区为空，或没有未保存修改时直接退出
+  if (!editor.getValue().trim() || !isDirty()) { void invoke('exit_app'); return; }
+  let saveFirst = false;
   try {
-    confirmed = await ask('当前 JSON 有未保存的修改，直接退出将丢失这些内容。仍要退出吗？', {
+    saveFirst = await ask('当前 JSON 有未保存的修改，是否保存后退出？', {
       title: '未保存的修改',
       kind: 'warning',
-      okLabel: '退出',
-      cancelLabel: '取消',
+      okLabel: '保存',
+      cancelLabel: '退出',
     });
   } catch {
-    confirmed = true;
+    saveFirst = false;
   }
-  if (!confirmed) return;
-  closeConfirmed = true;
-  void mainWindow.destroy();
+  if (saveFirst) {
+    const saved = mode === 'cloud' && currentObjectKey ? await pushS3() : await saveLocal();
+    if (!saved) return;
+  }
+  void invoke('exit_app');
 });
 updateBuckets();
 setDirty();

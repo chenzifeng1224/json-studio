@@ -143,6 +143,12 @@ struct StartupFile {
     content: String,
 }
 
+// 前端确认后直接退出进程，避免依赖窗口关闭/销毁权限
+#[tauri::command]
+fn exit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 // 资源管理器双击 .json（文件关联）启动时，从命令行参数中取出 JSON 文件并读取内容。
 #[tauri::command]
 fn take_startup_file() -> Option<StartupFile> {
@@ -346,7 +352,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![save_s3_credentials, credential_status, save_s3_preferences, load_s3_preferences, list_s3_level, search_s3_json, get_s3_object, put_s3_object, list_local_json_tree, read_local_json_file, write_local_json_file, take_startup_file])
+        .invoke_handler(tauri::generate_handler![save_s3_credentials, credential_status, save_s3_preferences, load_s3_preferences, list_s3_level, search_s3_json, get_s3_object, put_s3_object, list_local_json_tree, read_local_json_file, write_local_json_file, take_startup_file, exit_app])
         .run(tauri::generate_context!())
         .expect("应用启动失败");
 }
